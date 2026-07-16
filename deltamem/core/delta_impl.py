@@ -25,6 +25,8 @@ from deltamem.core.backbone_compat import (
     smollm3_eager_attention_forward,
 )
 from deltamem.kernels.affine_scan import triton_affine_scan, triton_scan_support
+# osgm new
+from deltamem.kernels.affine_scan_osgm import triton_affine_scan_osgm
 
 SUPPORTED_BASE_ATTENTION_TYPES = (Qwen3Attention,)
 if HAS_SMOLLM3:
@@ -607,6 +609,13 @@ class DeltaMemAttention(nn.Module):
         self.write_sentence_ids: torch.Tensor | None = None
         self.scan_impl = os.environ.get("DELTA_MEM_SCAN_IMPL", "auto")
 
+        self.osgm_precond_state: torch.Tensor | None = None
+
+        self.osgm_eta = 0.03
+        self.osgm_use_denominator = True
+        self.osgm_d_min = 1.0
+        self.osgm_d_max = 2.0
+
     def _normalize_query_states(self, states: torch.Tensor) -> torch.Tensor:
         q_norm = getattr(self.base, "q_norm", None)
         if q_norm is None:
@@ -688,6 +697,7 @@ class DeltaMemAttention(nn.Module):
 
     def reset_state(self) -> None:
         self.delta_state = None
+        self.osgm_precond_state = None
         self.read_context_mask = None
         self.last_beta_mean = None
         self.last_lambda_mean = None
@@ -1667,42 +1677,93 @@ class DeltaMemAttention(nn.Module):
                         .reshape(batch_size * num_partitions, seq_len)
                     )
 
-        use_triton = self.scan_impl != "torch"
-        if use_triton:
-            support = triton_scan_support(
-                state_for_scan,
-                q_for_scan,
-                k_for_scan,
-                v_for_scan,
-                keep_for_scan,
-                erase_for_scan,
-                write_for_scan,
+        if self.scan_impl == "triton_osgm":
+            precond_state = getattr(self, "osgm_precond_state", None)
+
+            expected_precond_shape = (
+                state_for_scan.size(0),
+                1,
+                k_for_scan.size(-1),
             )
-            use_triton = support.supported and self.scan_impl in {"auto", "triton"}
-            if self.scan_impl == "triton" and not support.supported:
-                raise RuntimeError(f"Triton scan requested but unavailable: {support.reason}")
-        if use_triton:
-            final_state, reads = triton_affine_scan(
-                state_for_scan,
-                q_for_scan,
-                k_for_scan,
-                v_for_scan,
-                keep_for_scan,
-                erase_for_scan,
-                write_for_scan,
+
+            # batch、head 或 partition 数量发生变化时，旧状态不能继续使用。
+            if precond_state is not None:
+                if (
+                    tuple(precond_state.shape) != expected_precond_shape
+                    or precond_state.device != k_for_scan.device
+                ):
+                    precond_state = None
+
+            final_state, reads, final_d = triton_affine_scan_osgm(
+                state=state_for_scan,
+                q=q_for_scan,
+                k=k_for_scan,
+                v=v_for_scan,
+                keep=keep_for_scan,
+                erase=erase_for_scan,
+                write=write_for_scan,
                 token_mask=token_mask_for_scan,
+                initial_d=precond_state,
+                eta=getattr(self, "osgm_eta", 0.03),
+                use_denominator=getattr(
+                    self,
+                    "osgm_use_denominator",
+                    True,
+                ),
+                d_min=getattr(self, "osgm_d_min", 1.0),
+                d_max=getattr(self, "osgm_d_max", 2.0),
+                output_final_state=True,
             )
+
+            # 仍保持 [B_scan, 1, rank] 的扁平形式。
+            self.osgm_precond_state = final_d
+
         else:
-            final_state, reads = self._memory_affine_scan_torch(
-                state_for_scan,
-                q_for_scan,
-                k_for_scan,
-                v_for_scan,
-                keep_for_scan,
-                erase_for_scan,
-                write_for_scan,
-                token_mask=token_mask_for_scan,
-            )
+            use_triton = self.scan_impl != "torch"
+
+            if use_triton:
+                support = triton_scan_support(
+                    state_for_scan,
+                    q_for_scan,
+                    k_for_scan,
+                    v_for_scan,
+                    keep_for_scan,
+                    erase_for_scan,
+                    write_for_scan,
+                )
+                use_triton = (
+                    support.supported
+                    and self.scan_impl in {"auto", "triton"}
+                )
+
+                if self.scan_impl == "triton" and not support.supported:
+                    raise RuntimeError(
+                        "Triton scan requested but unavailable: "
+                        f"{support.reason}"
+                    )
+
+            if use_triton:
+                final_state, reads = triton_affine_scan(
+                    state_for_scan,
+                    q_for_scan,
+                    k_for_scan,
+                    v_for_scan,
+                    keep_for_scan,
+                    erase_for_scan,
+                    write_for_scan,
+                    token_mask=token_mask_for_scan,
+                )
+            else:
+                final_state, reads = self._memory_affine_scan_torch(
+                    state_for_scan,
+                    q_for_scan,
+                    k_for_scan,
+                    v_for_scan,
+                    keep_for_scan,
+                    erase_for_scan,
+                    write_for_scan,
+                    token_mask=token_mask_for_scan,
+                )
 
         if self.multi_head_state:
             batch_size, seq_len, _ = memory_q_seq.shape

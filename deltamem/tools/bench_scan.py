@@ -65,6 +65,9 @@ def random_inputs(
 def run_bench(module: DeltaMemAttention, impl: str, inputs: dict[str, torch.Tensor], warmup: int, iters: int) -> float:
     module.scan_impl = impl
     for _ in range(warmup):
+        if impl == "triton_osgm":
+            module.osgm_precond_state = None
+            
         module._memory_affine_scan(
             inputs["state"],
             inputs["q"],
@@ -103,6 +106,7 @@ def main() -> None:
     inputs = random_inputs(args.batch_size, args.seq_len, args.rank, args.device, dtype)
     torch_ms = run_bench(module, "torch", inputs, args.warmup, args.iters)
     triton_ms = run_bench(module, "triton", inputs, args.warmup, args.iters)
+    osgm_ms = run_bench(module, "triton_osgm", inputs, args.warmup, args.iters)
     print(
         {
             "batch_size": args.batch_size,
@@ -111,6 +115,8 @@ def main() -> None:
             "dtype": args.dtype,
             "torch_ms": round(torch_ms, 4),
             "triton_ms": round(triton_ms, 4),
+            "triton_osgm_ms": round(osgm_ms, 4),
+            "osgm_vs_torch_speedup": round(torch_ms / osgm_ms, 4),
             "speedup": round(torch_ms / triton_ms, 4),
         }
     )
