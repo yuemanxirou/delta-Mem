@@ -25,9 +25,6 @@ from .fla.ops.os_delta_rule.chunk_osgm_phase_wy import (
 )
 '''
 
-
-
-
 @dataclass(frozen=True)
 class TritonScanSupport:
     supported: bool

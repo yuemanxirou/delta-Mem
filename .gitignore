@@ -89,6 +89,9 @@ global_step*/
 *.arrow
 *.parquet
 
+# Papers and PDFs
+*.pdf
+
 # Generated local reports from ad-hoc final experiment scans
 /docs/final_exp/*_model_matrix_*.md
 /docs/final_exp/*_locomo_ablation_*.md

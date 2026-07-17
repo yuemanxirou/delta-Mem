@@ -80,6 +80,9 @@ def run_bench(module: DeltaMemAttention, impl: str, inputs: dict[str, torch.Tens
     torch.cuda.synchronize()
     started_at = time.perf_counter()
     for _ in range(iters):
+        if impl == "triton_osgm":
+            module.osgm_precond_state = None
+            
         module._memory_affine_scan(
             inputs["state"],
             inputs["q"],

@@ -1,0 +1,524 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+# Copyright (c) 2026 Hongpei Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import torch
+import math
+import triton
+import triton.language as tl
+
+from fla.ops.utils.op import exp
+from fla.ops.utils.softplus import softplus
+from fla.utils import input_guard
+
+
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
+        "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+        "USE_D_CLAMP": lambda args: args["d_min"] is not None and args["d_max"] is not None,
+        "USE_INITIAL_D": lambda args: args["d0"] is not None,
+        "STORE_FINAL_D": lambda args: args["dt"] is not None,
+        "HAS_G_DECAY": lambda args: args["g_decay"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["N", "T"])
+def fused_recurrent_kda_fwd_kernel(
+    q,
+    k,
+    v,
+    g,
+    g_decay,
+    beta,
+    A_log,
+    dt_bias,
+    o,
+    h0,
+    ht,
+    d0,
+    dt,
+    eta,
+    d_decay_log,
+    d_min,
+    d_max,
+    cu_seqlens,
+    ssm_state_indices,
+    num_accepted_tokens,
+    lower_bound,
+    scale: tl.constexpr,
+    N: tl.int64,  
+    T: tl.int64,  
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    stride_init_state_token: tl.constexpr,
+    stride_final_state_token: tl.constexpr,
+    stride_init_d_token: tl.constexpr,
+    stride_final_d_token: tl.constexpr,
+    stride_g_decay_b: tl.constexpr,
+    stride_g_decay_t: tl.constexpr,
+    stride_g_decay_h: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
+    stride_indices_tok: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,  
+    USE_INITIAL_D: tl.constexpr,
+    INPLACE_FINAL_STATE: tl.constexpr,  
+    IS_BETA_HEADWISE: tl.constexpr,  
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_CONTINUOUS_BATCHING: tl.constexpr,
+    IS_SPEC_DECODING: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    STORE_FINAL_D: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    USE_GATE_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
+    USE_DENOMINATOR: tl.constexpr,
+    USE_D_CLAMP: tl.constexpr,
+    USE_D_DECAY: tl.constexpr,
+    HAS_G_DECAY: tl.constexpr,
+    BETA_AWARE: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    NV = tl.cdiv(V, BV)
+    NK = tl.cdiv(K, BK)
+    i_k = pid % NK
+    pid_rest = pid // NK
+
+    i_v = pid_rest % NV
+    i_nh = pid_rest // NV
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    
+    if IS_VARLEN:
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
+        T = eos - bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+
+    if T == 0:
+        return
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
+    
+    if IS_BETA_HEADWISE:
+        p_beta = beta + (bos * HV + i_hv) * V + o_v
+    else:
+        p_beta = beta + bos * HV + i_hv
+
+    p_g = g + (bos * HV + i_hv) * K + o_k
+    if HAS_G_DECAY:
+        if IS_VARLEN:
+            p_g_decay = g_decay + bos * stride_g_decay_t + i_hv * stride_g_decay_h
+        else:
+            p_g_decay = g_decay + i_n * stride_g_decay_b + i_hv * stride_g_decay_h
+    else:
+        p_g_decay = g_decay
+    p_o = o + (bos * HV + i_hv) * V + o_v
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    if TRANSPOSE_STATE:
+        mask_h = mask_v[:, None] & mask_k[None, :]
+    else:
+        mask_h = mask_k[:, None] & mask_v[None, :]
+
+    if TRANSPOSE_STATE:
+        b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    else:
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        
+    if USE_INITIAL_STATE:
+        if IS_CONTINUOUS_BATCHING:
+            if IS_SPEC_DECODING:
+                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+            else:
+                i_t = 0
+            p_h0 = (h0 + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64) * stride_init_state_token)
+            if TRANSPOSE_STATE:
+                p_h0 = p_h0 + i_hv * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+        else:
+            if TRANSPOSE_STATE:
+                p_h0 = h0 + (i_n * HV + i_hv) * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                p_h0 = h0 + (i_n * HV + i_hv) * K * V + o_k[:, None] * V + o_v[None, :]
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    b_d = tl.zeros([BK], dtype=tl.float32)
+    if USE_INITIAL_D:
+        if IS_CONTINUOUS_BATCHING:
+            if IS_SPEC_DECODING:
+                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+            else:
+                i_t = 0
+            p_d0 = d0 + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64) * stride_init_d_token
+            p_d0 = p_d0 + i_hv * K + o_k
+        else:
+            p_d0 = d0 + (i_n * HV + i_hv) * K + o_k
+        b_d += tl.load(p_d0, mask=mask_k, other=0).to(tl.float32)
+
+    for i_t in tl.range(0, T, num_stages=num_stages):
+        b_q = tl.load(p_q, mask=mask_k, other=0, eviction_policy='evict_last').to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0, eviction_policy='evict_last').to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0, eviction_policy='evict_first').to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            
+        b_q = b_q * scale
+        b_g = tl.load(p_g, eviction_policy='evict_last').to(tl.float32)
+
+        if USE_GATE_IN_KERNEL:
+            b_A = tl.load(A_log + i_h).to(tl.float32)
+            if HAS_DT_BIAS:
+                b_bias = tl.load(dt_bias + i_h * K + o_k, mask=mask_k, other=0).to(tl.float32)
+                b_g = b_g + b_bias
+            if USE_LOWER_BOUND:
+                b_gk = lower_bound * tl.sigmoid(exp(b_A) * b_g)
+            else:
+                b_gk = -exp(b_A) * softplus(b_g)
+        else:
+            b_gk = b_g
+
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0, eviction_policy='evict_first').to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta, eviction_policy='evict_last').to(tl.float32)
+
+        b_k_sq = b_k * b_k
+        b_k_sq_masked = tl.where(mask_k, b_k_sq, 0.0)
+
+        dot_dk2 = tl.sum(b_d * b_k_sq_masked)
+        if BETA_AWARE:
+            term_A = 1.0 - b_beta * dot_dk2
+        else:
+            term_A = 1.0 - dot_dk2
+
+        if USE_DENOMINATOR:
+            sum_k2 = tl.sum(b_k_sq_masked) + 1e-5
+            grad_d = term_A / sum_k2
+        else:
+            grad_d = term_A
+
+        if BETA_AWARE:
+            grad_d = b_beta * grad_d
+            
+        if HAS_G_DECAY:
+            b_d_decay = tl.exp(tl.load(p_g_decay).to(tl.float32))
+            b_d_next = b_d_decay * b_d + eta * grad_d * b_k_sq_masked
+        elif USE_D_DECAY:
+            b_d_next = exp(d_decay_log) * b_d + eta * grad_d * b_k_sq_masked
+        else:
+            b_d_next = b_d + eta * grad_d * b_k_sq_masked
+        
+        if USE_D_CLAMP:
+            b_d_next = tl.minimum(tl.maximum(b_d_next, d_min), d_max)
+
+        b_k_update = b_k * b_d  
+        
+        b_d = b_d_next
+
+        if TRANSPOSE_STATE:
+            b_h *= exp(b_gk[None, :])
+        else:
+            b_h *= exp(b_gk[:, None])
+
+        if TRANSPOSE_STATE:
+            b_v -= tl.sum(b_h * b_k[None, :], 1)
+        else:
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            
+        b_v *= b_beta
+        
+        if TRANSPOSE_STATE:
+            b_h += b_v[:, None] * b_k_update[None, :]
+            b_o = tl.sum(b_h * b_q[None, :], 1)
+        else:
+            b_h += b_k_update[:, None] * b_v[None, :]
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v, eviction_policy='evict_first')
+
+        if IS_CONTINUOUS_BATCHING:
+            if INPLACE_FINAL_STATE:
+                p_ht = (ht + tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64) * stride_final_state_token)
+            else:
+                p_ht = ht + (bos + i_t) * stride_final_state_token
+            if TRANSPOSE_STATE:
+                p_ht = p_ht + i_hv * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+        p_q += H * K
+        p_k += H * K
+        p_o += HV * V
+        p_v += HV * V
+        p_g += HV * K
+        if HAS_G_DECAY:
+            p_g_decay += stride_g_decay_t
+        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
+
+    if not IS_CONTINUOUS_BATCHING:
+        if STORE_FINAL_STATE:
+            if TRANSPOSE_STATE:
+                p_ht = ht + (i_n * HV + i_hv) * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                p_ht = ht + (i_n * HV + i_hv) * K * V + o_k[:, None] * V + o_v[None, :]
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+        if STORE_FINAL_D:
+            p_dt = dt + (i_n * HV + i_hv) * K + o_k
+            tl.store(p_dt, b_d.to(p_dt.dtype.element_ty), mask=mask_k)
+
+
+@torch.compiler.disable
+def fused_recurrent_kda_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    g_decay: torch.Tensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    initial_d: torch.Tensor | None = None,
+    scale: float | None = None,
+    eta: float = 1.0,
+    use_denominator: bool = False,
+    d_min: float | None = None,
+    d_max: float | None = None,
+    beta_aware: bool = False,
+    decay_mode: str = "none",
+    decay_gamma: float = 1.0,
+    output_final_state: bool = False,
+    output_final_d: bool = False,
+    inplace_final_state: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    lower_bound: float | None = None,
+    out: torch.Tensor | None = None,
+    transpose_state_layout: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if beta_aware and beta.ndim == v.ndim:
+        raise NotImplementedError("OSKDA fused recurrent beta-aware d-state requires scalar beta per head.")
+    if ssm_state_indices is not None and output_final_d:
+        raise NotImplementedError("OSKDA fused recurrent final d-state is not implemented for state-indexed batching.")
+
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    HV = v.shape[2]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    BK = triton.next_power_of_2(K)
+    BV = 32
+
+    if out is None:
+        out = torch.zeros_like(v)
+    else:
+        assert out.shape == v.shape
+    if inplace_final_state:
+        assert initial_state is not None
+        final_state = initial_state
+    elif output_final_state:
+        if transpose_state_layout:
+            final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
+        else:
+            final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
+    else:
+        final_state = None
+
+    if output_final_d:
+        final_d = q.new_empty(N, HV, K, dtype=torch.float32)
+    else:
+        final_d = None
+
+    if initial_d is not None:
+        initial_d = initial_d.contiguous()
+
+    stride_init_state_token = initial_state.stride(0) if initial_state is not None else 1
+    stride_final_state_token = final_state.stride(0) if final_state is not None else 1
+    stride_init_d_token = initial_d.stride(0) if initial_d is not None else 1
+    stride_final_d_token = final_d.stride(0) if final_d is not None else 1
+
+    if ssm_state_indices is None:
+        stride_indices_seq, stride_indices_tok = 1, 1
+    elif ssm_state_indices.ndim == 1:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
+    else:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+
+    grid = (triton.cdiv(V, BV) * N * HV, )
+    if decay_mode == "none":
+        d_decay_log = 0.0
+        use_d_decay = False
+    elif decay_mode == "constant":
+        d_decay_log = math.log(float(decay_gamma))
+        use_d_decay = True
+    elif decay_mode == "data_dependent":
+        if g_decay is None:
+            raise ValueError("decay_mode='data_dependent' requires g_decay")
+        d_decay_log = 0.0
+        use_d_decay = True
+    else:
+        raise NotImplementedError(f"Unsupported OSKDA d decay mode: {decay_mode}")
+
+    fused_recurrent_kda_fwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        g_decay=g_decay,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=out,
+        h0=initial_state,
+        ht=final_state,
+        d0=initial_d,
+        dt=final_d,
+        eta=eta,
+        d_decay_log=d_decay_log,
+        d_min=d_min if d_min is not None else -1e9,
+        d_max=d_max if d_max is not None else 1e9, 
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        lower_bound=lower_bound,
+        scale=scale,
+        N=N,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        stride_init_state_token=stride_init_state_token,
+        stride_final_state_token=stride_final_state_token,
+        stride_init_d_token=stride_init_d_token,
+        stride_final_d_token=stride_final_d_token,
+        stride_g_decay_b=g_decay.stride(0) if g_decay is not None else 1,
+        stride_g_decay_t=g_decay.stride(1) if g_decay is not None else 1,
+        stride_g_decay_h=g_decay.stride(2) if g_decay is not None else 1,
+        stride_indices_seq=stride_indices_seq,
+        stride_indices_tok=stride_indices_tok,
+        IS_BETA_HEADWISE=beta.ndim == v.ndim,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        INPLACE_FINAL_STATE=inplace_final_state,
+        USE_GATE_IN_KERNEL=use_gate_in_kernel,
+        TRANSPOSE_STATE=transpose_state_layout,
+        USE_DENOMINATOR=use_denominator,         
+        USE_D_DECAY=use_d_decay,
+        BETA_AWARE=beta_aware,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out, final_state, final_d
+
+
+@input_guard
+def fused_recurrent_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    g_decay: torch.Tensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    scale: float | None = None,
+    eta: float = 1.0,
+    use_denominator: bool = False,
+    d_min: float | None = None,
+    d_max: float | None = None,
+    initial_state: torch.Tensor = None,
+    initial_d: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    output_final_d: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    transpose_state_layout: bool = False,
+    beta_aware: bool = False,
+    decay_mode: str = "none",
+    decay_gamma: float = 1.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    initial_h = initial_state
+    if isinstance(initial_state, tuple):
+        initial_h, state_d = initial_state
+        if initial_d is None:
+            initial_d = state_d
+
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`.")
+        if initial_h is not None and initial_h.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError("Initial states mismatch.")
+        if initial_d is not None and initial_d.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError("Initial d-states mismatch.")
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    o, final_state, final_d = fused_recurrent_kda_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        g_decay=g_decay,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        eta=eta,
+        use_denominator=use_denominator,
+        d_min=d_min,
+        d_max=d_max,
+        beta_aware=beta_aware,
+        decay_mode=decay_mode,
+        decay_gamma=decay_gamma,
+        initial_state=initial_h,
+        initial_d=initial_d,
+        inplace_final_state=False,
+        output_final_state=output_final_state,
+        output_final_d=output_final_d,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        transpose_state_layout=transpose_state_layout,
+    )
+    if output_final_d:
+        return o, final_state, final_d
+    return o, final_state

@@ -23,13 +23,13 @@ def _next_power_of_2(value: int) -> int:
 
 
 def triton_scan_support(
-    state: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    keep: torch.Tensor,
-    erase: torch.Tensor,
-    write: torch.Tensor,
+    state: torch.Tensor, # [B, R, R]
+    q: torch.Tensor, # [B, T, R]
+    k: torch.Tensor, # [B, T, R]
+    v: torch.Tensor, # [B, T, R]
+    keep: torch.Tensor, # [B, T, R]
+    erase: torch.Tensor, # [B, T, R]
+    write: torch.Tensor, # [B, T, R]
 ) -> TritonScanSupport:
     if triton is None or tl is None:
         return TritonScanSupport(False, "triton is unavailable")
@@ -118,11 +118,11 @@ if triton is not None and tl is not None:
         while t < seq_len:
             hist_offsets = (
                 batch_idx * hist_b_stride
-                + t * hist_t_stride
+                + t * hist_t_stride 
                 + row_idx * hist_row_stride
                 + cols * hist_col_stride
             )
-            tl.store(state_hist_ptr + hist_offsets, state_vec, mask=col_mask)
+            tl.store(state_hist_ptr + hist_offsets, state_vec, mask=col_mask) # 这是为了反向传播
 
             valid = tl.full((), 1, tl.int32)
             if HAS_MASK:
@@ -139,7 +139,7 @@ if triton is not None and tl is not None:
 
             k_vec = tl.load(k_ptr + q_offsets, mask=col_mask, other=0.0).to(tl.float32)
             scalar_offset = batch_idx * scalar_b_stride + t * scalar_t_stride + row_idx * scalar_r_stride
-            v_scalar = tl.load(v_ptr + scalar_offset).to(tl.float32)
+            v_scalar = tl.load(v_ptr + scalar_offset).to(tl.float32) # shape: [B, T, R] -> [B, T, R]，所以这里是一个标量
             keep_scalar = tl.load(keep_ptr + scalar_offset).to(tl.float32)
             erase_scalar = tl.load(erase_ptr + scalar_offset).to(tl.float32)
             write_scalar = tl.load(write_ptr + scalar_offset).to(tl.float32)
@@ -311,10 +311,10 @@ class _TritonAffineScanFn(torch.autograd.Function):
         seq_len = q.size(1)
         reads = torch.empty_like(v)
         state_out = torch.empty_like(state0)
-        state_hist = torch.empty((batch_size, seq_len, rank, rank), device=state0.device, dtype=state0.dtype)
+        state_hist = torch.empty((batch_size, seq_len, rank, rank), device=state0.device, dtype=state0.dtype) # （B, T, R, R）用于保存每个时间步的state，方便反向传播
 
         block_r = _next_power_of_2(rank)
-        grid = (batch_size * rank,)
+        grid = (batch_size * rank,) # 启动batch_size * rank个program
         _affine_scan_forward_kernel[grid](
             state0,
             q,
