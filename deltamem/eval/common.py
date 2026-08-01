@@ -50,7 +50,7 @@ def _distributed_debug_log(context: DistributedContext, message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[dist-debug][{timestamp}][rank{context.rank}] {message}", flush=True)
 
-
+"""
 def init_distributed(device: str) -> DistributedContext:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -78,7 +78,81 @@ def init_distributed(device: str) -> DistributedContext:
     # Lazily creating it after hours of skewed evaluation can hit the Gloo store timeout.
     _ensure_control_group(context)
     return context
+"""
 
+def init_distributed(device: str) -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    enabled = world_size > 1
+
+    print(
+        f"[rank {rank}] init start: "
+        f"world_size={world_size}, "
+        f"local_rank={local_rank}, "
+        f"device_arg={device}",
+        flush=True,
+    )
+
+    resolved_device = device
+
+    if enabled and device.startswith("cuda"):
+        resolved_device = f"cuda:{local_rank}"
+
+        print(
+            f"[rank {rank}] before torch.cuda.set_device({local_rank})",
+            flush=True,
+        )
+
+        torch.cuda.set_device(local_rank)
+
+        print(
+            f"[rank {rank}] after torch.cuda.set_device, "
+            f"current_device={torch.cuda.current_device()}",
+            flush=True,
+        )
+
+    if enabled and not dist.is_initialized():
+        backend = "nccl" if resolved_device.startswith("cuda") else "gloo"
+        timeout_minutes = int(os.environ.get("DIST_TIMEOUT_MINUTES", "180"))
+
+        print(
+            f"[rank {rank}] before dist.init_process_group("
+            f"backend={backend})",
+            flush=True,
+        )
+
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(minutes=timeout_minutes),
+        )
+
+        print(
+            f"[rank {rank}] after dist.init_process_group",
+            flush=True,
+        )
+
+    context = DistributedContext(
+        enabled=enabled,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=resolved_device,
+    )
+
+    print(
+        f"[rank {rank}] before _ensure_control_group",
+        flush=True,
+    )
+
+    _ensure_control_group(context)
+
+    print(
+        f"[rank {rank}] after _ensure_control_group",
+        flush=True,
+    )
+
+    return context
 
 def _control_group_supported(context: DistributedContext) -> bool:
     if not context.enabled or not dist.is_initialized():

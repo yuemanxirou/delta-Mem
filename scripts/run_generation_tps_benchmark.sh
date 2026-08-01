@@ -6,6 +6,7 @@ ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
+
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Missing Python environment: set PYTHON_BIN or run ./scripts/setup_uv_env.sh first" >&2
   exit 1
@@ -14,7 +15,7 @@ fi
 MODEL_KINDS="${MODEL_KINDS:-base}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
 ADAPTER_DIR="${ADAPTER_DIR:-}"
-ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 PROMPT_LENGTHS="${PROMPT_LENGTHS:-4096 16384 32768}"
 DECODE_LENGTHS="${DECODE_LENGTHS:-64 256}"
 OUTPUT_JSON="${OUTPUT_JSON:-}"

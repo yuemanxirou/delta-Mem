@@ -14,21 +14,36 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
-PIPELINE_ROOT="/root/outputs/qasper_multimodel_write8192_train_and_benchmark_suite_smollm3_3b_consistent70"
-LOG_ROOT="/root/outputs/qasper_multimodel_write8192_train_and_benchmark_suite_smollm3_3b_consistent70/logs"
-MANIFEST_PATH="/root/outputs/qasper_multimodel_write8192_train_and_benchmark_suite_smollm3_3b_consistent70/run_manifest.txt"
+
+# GPU config (override via env)
+GPU_IDS="${GPU_IDS:-0,2,3}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+
+_find_checkpoint() {
+  # Finds the latest checkpoint-* directory under a trainer dir.
+  local trainer_dir="$1"
+  local latest=""
+  if [[ -d "${trainer_dir}" ]]; then
+    latest=$(find "${trainer_dir}" -maxdepth 1 -name 'checkpoint-*' -type d 2>/dev/null | sort -t- -k2 -n | tail -1)
+  fi
+  printf '%s' "${latest}"
+}
+PIPELINE_ROOT="/DATA/disk0/liuyuerou/projects/delta-Mem/outputs/qasper_multimodel_write8192_train_and_benchmark_suite_smollm3_3b_consistent70"
+LOG_ROOT="/DATA/disk0/liuyuerou/projects/delta-Mem/outputs/qasper_multimodel_write8192_train_and_benchmark_suite_smollm3_3b_consistent70/logs"
+MANIFEST_PATH="/DATA/disk0/liuyuerou/projects/delta-Mem/outputs/qasper_multimodel_write8192_train_and_benchmark_suite_smollm3_3b_consistent70/run_manifest.txt"
 EVAL_SCRIPT="${ROOT_DIR}/scripts/run_qasper_multimodel_write8192_benchmark_suite_smollm3_3b.sh"
-WANDB_DIR="/root/wandb"
-HF_HOME="/root/huggingface"
-HF_HUB_CACHE="/root/huggingface/hub"
-HF_DATASETS_CACHE="/root/datasets_cache"
-TOKENIZED_DATASET_ROOT="/root/dataset/deltamem_tokenized"
+WANDB_DIR="/DATA/disk0/liuyuerou/projects/delta-Mem/wandb"
+HF_HOME="/DATA/disk0/liuyuerou/projects/delta-Mem/huggingface"
+HF_HUB_CACHE="/DATA/disk0/liuyuerou/projects/delta-Mem/huggingface/hub"
+HF_DATASETS_CACHE="/DATA/disk0/liuyuerou/projects/delta-Mem/datasets_cache"
+TOKENIZED_DATASET_ROOT="/DATA/disk0/liuyuerou/projects/delta-Mem/dataset/deltamem_tokenized"
 DEEPSPEED_CONFIG="${ROOT_DIR}/deepspeed_zero2.json"
-BASE_MODEL_PATH="/root/huggingface/models--HuggingFaceTB--SmolLM3-3B/snapshots/a07cc9a04f16550a088caea529712d1d335b0ac1"
-TRAIN_FILE="/root/data/agent_memory_qasper_ctx8192_episode_safe_seed42.jsonl"
+BASE_MODEL_PATH="/DATA/disk0/liuyuerou/projects/delta-Mem/huggingface/models--HuggingFaceTB--SmolLM3-3B/snapshots/a07cc9a04f16550a088caea529712d1d335b0ac1"
+TRAIN_FILE="/DATA/disk0/liuyuerou/projects/delta-Mem/data/agent_memory_qasper_ctx8192_episode_safe_seed42.jsonl"
 
 # Runtime
-ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 WANDB_PROJECT="delta-mem-smollm3"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
 
@@ -37,7 +52,7 @@ DELTA_WRITE_SPARSITY_TARGET="0.05"
 
 # Variant-specific delta hyperparameters
 SSW_RUN_NAME="smollm3_3b_delta_mem_qasper_6k_seed42_rank8_qo_SSW_write8192_consistent70"
-SSW_OUTPUT_DIR="/root/models/smollm3_3b_delta_mem_qasper_6k_seed42_rank8_qo_SSW_write8192_consistent70"
+SSW_OUTPUT_DIR="/DATA/disk0/liuyuerou/projects/delta-Mem/models/smollm3_3b_delta_mem_qasper_6k_seed42_rank8_qo_SSW_write8192_consistent70"
 SSW_NUM_STATE_HEADS="1"
 SSW_WRITE_GRANULARITY="message_mean"
 SSW_MASTER_PORT="30682"
@@ -45,7 +60,7 @@ SSW_WANDB_GROUP="qasper-multimodel-write8192-delta"
 SSW_WANDB_TAGS="qasper,delta,SSW,write8192,consistent70"
 
 TSW_RUN_NAME="smollm3_3b_delta_mem_qasper_6k_seed42_rank8_qo_TSW_write8192_consistent70"
-TSW_OUTPUT_DIR="/root/models/smollm3_3b_delta_mem_qasper_6k_seed42_rank8_qo_TSW_write8192_consistent70"
+TSW_OUTPUT_DIR="/DATA/disk0/liuyuerou/projects/delta-Mem/models/smollm3_3b_delta_mem_qasper_6k_seed42_rank8_qo_TSW_write8192_consistent70"
 TSW_NUM_STATE_HEADS="1"
 TSW_WRITE_GRANULARITY="token"
 TSW_MASTER_PORT="30683"
@@ -53,7 +68,7 @@ TSW_WANDB_GROUP="qasper-multimodel-write8192-delta"
 TSW_WANDB_TAGS="qasper,delta,TSW,write8192,consistent70"
 
 MSW_RUN_NAME="smollm3_3b_delta_mem_qasper_6k_seed42_MSW_write8192_consistent70"
-MSW_OUTPUT_DIR="/root/models/smollm3_3b_delta_mem_qasper_6k_seed42_MSW_write8192_consistent70"
+MSW_OUTPUT_DIR="/DATA/disk0/liuyuerou/projects/delta-Mem/models/smollm3_3b_delta_mem_qasper_6k_seed42_MSW_write8192_consistent70"
 MSW_NUM_STATE_HEADS="4"
 MSW_WRITE_GRANULARITY="token"
 MSW_MASTER_PORT="30684"
@@ -115,7 +130,7 @@ COMMON_WANDB_ARGS=(
   --wandb
   --wandb-project "${WANDB_PROJECT}"
   --wandb-dir "${WANDB_DIR}"
-  --wandb-mode online
+  --wandb-mode offline
 )
 
 cd "${ROOT_DIR}"
@@ -154,7 +169,7 @@ run_with_log() {
 
 training_is_complete() {
   local output_dir="$1"
-  [[ -d "${output_dir}/trainer/checkpoint-70" || -f "${output_dir}/training_summary.json" ]]
+  [[ -n "$(_find_checkpoint "${output_dir}/trainer")" || -f "${output_dir}/training_summary.json" ]]
 }
 
 run_delta_train() {
@@ -174,7 +189,7 @@ run_delta_train() {
 
   run_with_log "${log_file}" \
     "${PYTHON_BIN}" -m torch.distributed.run \
-    --nproc_per_node 8 \
+    --nproc_per_node "${NPROC_PER_NODE}" \
     --master_addr 127.0.0.1 \
     --master_port "${master_port}" \
     -m deltamem.train.delta_sft_experimental \

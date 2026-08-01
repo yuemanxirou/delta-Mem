@@ -5,20 +5,35 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
-SUITE_ROOT="/root/outputs/qasper_multimodel_write8192_benchmark_suite_qwen3_8b_consistent70"
+
+# GPU config (override via env)
+GPU_IDS="${GPU_IDS:-0,2,3}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+
+_find_checkpoint() {
+  # Finds the latest checkpoint-* directory under a trainer dir.
+  local trainer_dir="$1"
+  local latest=""
+  if [[ -d "${trainer_dir}" ]]; then
+    latest=$(find "${trainer_dir}" -maxdepth 1 -name 'checkpoint-*' -type d 2>/dev/null | sort -t- -k2 -n | tail -1)
+  fi
+  printf '%s' "${latest}"
+}
+SUITE_ROOT="/DATA/disk0/liuyuerou/projects/delta-Mem/outputs/qasper_multimodel_write8192_benchmark_suite_qwen3_8b_consistent70"
 LOG_ROOT="${SUITE_ROOT}/logs"
 MANIFEST_PATH="${SUITE_ROOT}/run_manifest.txt"
-HF_HOME="/root/huggingface"
-HF_HUB_CACHE="/root/huggingface/hub"
-HF_DATASETS_CACHE="/root/datasets_cache"
-MEMORY_AGENT_BENCH_ROOT="/root/external/MemoryAgentBench"
+HF_HOME="/DATA/disk0/liuyuerou/projects/delta-Mem/huggingface"
+HF_HUB_CACHE="/DATA/disk0/liuyuerou/projects/delta-Mem/huggingface/hub"
+HF_DATASETS_CACHE="/DATA/disk0/liuyuerou/projects/delta-Mem/datasets_cache"
+MEMORY_AGENT_BENCH_ROOT="/DATA/disk0/liuyuerou/projects/delta-Mem/external/MemoryAgentBench"
 LOCOMO_DATA_FILE="${ROOT_DIR}/data/locomo10.json"
-BASE_MODEL_PATH="/root/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
-SSW_ADAPTER_DIR="${SSW_ADAPTER_DIR:-/root/models/qwen3_8b_delta_mem_qasper_6k_seed42_rank8_qo_SSW_write8192_consistent70/trainer/checkpoint-70}"
-TSW_ADAPTER_DIR="${TSW_ADAPTER_DIR:-/root/models/qwen3_8b_delta_mem_qasper_6k_seed42_rank8_qo_TSW_write8192_consistent70/trainer/checkpoint-70}"
-MSW_ADAPTER_DIR="${MSW_ADAPTER_DIR:-/root/models/qwen3_8b_delta_mem_qasper_6k_seed42_MSW_write8192_consistent70/trainer/checkpoint-70}"
+BASE_MODEL_PATH="/DATA/disk0/liuyuerou/projects/delta-Mem/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
+SSW_ADAPTER_DIR="${SSW_ADAPTER_DIR:-$(_find_checkpoint "/DATA/disk0/liuyuerou/projects/delta-Mem/models/qwen3_8b_delta_mem_qasper_6k_seed42_rank8_qo_SSW_write8192_consistent70/trainer")}"
+TSW_ADAPTER_DIR="${TSW_ADAPTER_DIR:-$(_find_checkpoint "/DATA/disk0/liuyuerou/projects/delta-Mem/models/qwen3_8b_delta_mem_qasper_6k_seed42_rank8_qo_TSW_write8192_consistent70/trainer")}"
+MSW_ADAPTER_DIR="${MSW_ADAPTER_DIR:-$(_find_checkpoint "/DATA/disk0/liuyuerou/projects/delta-Mem/models/qwen3_8b_delta_mem_qasper_6k_seed42_MSW_write8192_consistent70/trainer")}"
 
-ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 DEFAULT_EVAL_TASKS=(locomo hotpotqa gpqa_diamond ifeval memory_agent_bench)
 EVAL_TASKS_STRING="${EVAL_TASKS_STRING:-${DEFAULT_EVAL_TASKS[*]}}"
 read -r -a EVAL_TASKS <<< "${EVAL_TASKS_STRING}"
@@ -114,7 +129,7 @@ run_locomo_base_like() {
   fi
   run_with_log "${log_file}" \
     "${PYTHON_BIN}" -m torch.distributed.run \
-    --nproc_per_node 8 \
+    --nproc_per_node "${NPROC_PER_NODE}" \
     --master_addr 127.0.0.1 \
     --master_port "${master_port}" \
     -m deltamem.eval.locomo_delta \
@@ -145,7 +160,7 @@ run_locomo_delta_only() {
   fi
   run_with_log "${log_file}" \
     "${PYTHON_BIN}" -m torch.distributed.run \
-    --nproc_per_node 8 \
+    --nproc_per_node "${NPROC_PER_NODE}" \
     --master_addr 127.0.0.1 \
     --master_port "${master_port}" \
     -m deltamem.eval.locomo_delta \
@@ -181,7 +196,7 @@ run_benchmark_task_base_like() {
   # MemoryAgentBench inputs before token-budget truncation.
   run_with_log "${log_file}" \
     "${PYTHON_BIN}" -m torch.distributed.run \
-    --nproc_per_node 8 \
+    --nproc_per_node "${NPROC_PER_NODE}" \
     --master_addr 127.0.0.1 \
     --master_port "${master_port}" \
     -m deltamem.eval.benchmark_compare \
@@ -232,7 +247,7 @@ run_benchmark_task_delta_only() {
   # MemoryAgentBench inputs before token-budget truncation.
   run_with_log "${log_file}" \
     "${PYTHON_BIN}" -m torch.distributed.run \
-    --nproc_per_node 8 \
+    --nproc_per_node "${NPROC_PER_NODE}" \
     --master_addr 127.0.0.1 \
     --master_port "${master_port}" \
     -m deltamem.eval.benchmark_compare \
