@@ -1,6 +1,6 @@
-# Qwen3-4B DeltaMem Session adapter (LoCoMo 50.02%)
+# PAWmem Qwen3-4B QASPER adapter (LoCoMo 50.02%)
 
-This directory contains the **trained DeltaMem adapter**, not the Qwen3-4B base weights. It is the adapter used for the 50.02% LoCoMo result under the `official_prompt` evaluation mode.
+This directory contains the **PAWmem trained adapter**, not the Qwen3-4B base weights. It is the QASPER-trained adapter used for the 50.02% LoCoMo result under the `official_prompt` evaluation mode. The user-supplied cross-training benchmark table is preserved in [the results record](../../docs/results/PAWmem_training_set_benchmark_table_2026-10-22.md); its other cells require separate source-file verification.
 
 ## Files
 
