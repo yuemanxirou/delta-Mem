@@ -20,8 +20,7 @@ python -m torch.distributed.run --standalone --nproc_per_node="$GPUS" \
   -m deltamem.eval.locomo_delta \
   --model-path "$MODEL_PATH" --adapter-dir "$ADAPTER_DIR" --data-file "$DATA_FILE" \
   --device cuda:0 --dtype bfloat16 --attn-implementation sdpa \
-  --skip-base --delta-conditions full_history_replay --categories 1 2 3 4 \
+  --skip-base --delta-conditions official_prompt --categories 1 2 3 4 \
   --seed 42 --eval-batch-size 32 --max-new-tokens 50 --answer-reserve-tokens 50 \
-  --full-history-mode official_prompt --history-message-granularity session \
-  --history-do-sample --history-temperature 0.4 --history-top-p 0.9 --history-top-k 10 \
+  --official-do-sample --official-temperature 0.4 --official-top-p 0.9 --official-top-k 10 \
   --output-json "$OUTPUT_JSON" "$@"

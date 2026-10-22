@@ -1,6 +1,6 @@
 # PAWmem: reproduce QASPER training and LoCoMo evaluation
 
-This is the complete runnable recipe for the **PAWmem Qwen3-4B × QASPER History-turn** checkpoint. The verified LoCoMo result is **50.02% (1,540 questions)** with `full_history_mode=official_prompt`. The 46.69% result used `history_replay` and is a different evaluation protocol. The JSON result key is named `full_history_replay` in both cases; check `full_history_mode` in the run metadata before quoting a score.
+This is the complete runnable recipe for the **PAWmem Qwen3-4B × QASPER History-turn** checkpoint. The verified LoCoMo result is **50.02% (1,540 questions)** with `full_history_mode=official_prompt`. The 46.69% result used `history_replay` and is a different evaluation protocol. The archived original JSON uses the old condition key `full_history_replay`; its `full_history_mode=official_prompt` metadata establishes the protocol. New runs use the unambiguous `official_prompt` key.
 
 ## 1. Clone and install
 

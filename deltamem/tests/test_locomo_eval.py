@@ -7,7 +7,6 @@ import pytest
 
 from deltamem.eval.locomo_protocol import (
     build_official_question_prompt,
-    build_locomo_history_messages,
     canonicalize_locomo_prediction,
     prepare_locomo_question,
 )
@@ -44,28 +43,6 @@ def make_sample() -> dict:
         },
         "qa": [],
     }
-
-
-def test_build_locomo_history_messages_renders_sessions_as_user_chunks() -> None:
-    messages = build_locomo_history_messages(make_sample())
-
-    assert messages[0]["role"] == "system"
-    assert "helpful, respectful and honest assistant" in messages[0]["content"]
-    assert messages[1] == {
-        "role": "user",
-        "content": 'DATE: 9:00 am on 1 Jan, 2024\nCONVERSATION:\nAlice said, "I bought oranges."\n\nBob said, "I went to the library."',
-    }
-    assert 'and shared a sunset over the water.' in messages[2]["content"]
-
-
-def test_build_locomo_history_messages_supports_turn_granularity() -> None:
-    messages = build_locomo_history_messages(make_sample(), message_granularity="turn")
-
-    assert messages[0]["role"] == "system"
-    assert len(messages) == 4
-    assert messages[1]["content"] == 'DATE: 9:00 am on 1 Jan, 2024\nCONVERSATION:\nAlice said, "I bought oranges."'
-    assert messages[2]["content"] == 'DATE: 9:00 am on 1 Jan, 2024\nCONVERSATION:\nBob said, "I went to the library."'
-    assert 'and shared a sunset over the water.' in messages[3]["content"]
 
 
 def test_build_question_prompt_includes_no_info_instruction_for_adversarial() -> None:
@@ -145,49 +122,25 @@ def test_validate_locomo_question_count_skips_filename_check_when_categories_fil
     validate_locomo_question_count(data_file, samples, categories=[1, 2, 3, 4])
 
 
-def test_evaluate_locomo_conditions_skips_snapshot_work_for_official_full_history_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_evaluate_locomo_conditions_uses_official_prompt_only(monkeypatch: pytest.MonkeyPatch) -> None:
     sample = make_sample()
-    sample["qa"] = [
-        {
-            "question": "What did Alice buy?",
-            "answer": "oranges",
-            "category": 1,
-        }
-    ]
-
-    snapshot_calls = []
-    monkeypatch.setattr(
-        "deltamem.eval.locomo_delta.build_teacher_forced_snapshot",
-        lambda *args, **kwargs: snapshot_calls.append((args, kwargs)),
+    sample["qa"] = [{"question": "What did Alice buy?", "answer": "oranges", "category": 1}]
+    calls = []
+    def fake_generate(*args, **kwargs):
+        calls.append(kwargs)
+        return "oranges", "oranges"
+    monkeypatch.setattr("deltamem.eval.locomo_delta.generate_official_full_history_answer", fake_generate)
+    args = dict(
+        model="model", tokenizer="tokenizer", device="cpu", samples=[sample],
+        question_tasks=[(0, 0, 0)], condition_names=["official_prompt"],
+        max_new_tokens=16, seed=42, answer_reserve_tokens=50,
+        official_do_sample=False, official_temperature=1.0,
+        official_top_p=1.0, official_top_k=0, eval_batch_size=1,
     )
-    monkeypatch.setattr(
-        "deltamem.eval.locomo_delta.generate_official_full_history_answer",
-        lambda *args, **kwargs: ("oranges", "oranges"),
-    )
-
-    records = evaluate_locomo_conditions(
-        model="model",
-        tokenizer="tokenizer",
-        device="cpu",
-        samples=[sample],
-        question_tasks=[(0, 0, 0)],
-        condition_names=["full_history_replay"],
-        max_new_tokens=16,
-        seed=42,
-        answer_reserve_tokens=50,
-        full_history_mode="official_prompt",
-        history_message_granularity="session",
-        history_do_sample=False,
-        history_temperature=1.0,
-        history_top_p=1.0,
-        history_top_k=0,
-        eval_batch_size=1,
-    )
-
-    assert len(records) == 1
-    assert snapshot_calls == []
-    qa_record = cast(dict[str, object], records[0][2])
-    conditions = cast(dict[str, dict[str, object]], qa_record["conditions"])
-    assert conditions["full_history_replay"]["score"] == 1.0
+    records = evaluate_locomo_conditions(**args)
+    assert len(calls) == 1
+    assert calls[0]["do_sample"] is False
+    conditions = cast(dict[str, dict[str, object]], records[0][2]["conditions"])
+    assert conditions["official_prompt"]["score"] == 1.0
+    with pytest.raises(ValueError, match="Only the official LoCoMo prompt"):
+        evaluate_locomo_conditions(**{**args, "condition_names": ["unsupported"]})

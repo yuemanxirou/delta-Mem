@@ -42,8 +42,7 @@ python -m torch.distributed.run \
     --eval-batch-size 32 \
     --answer-reserve-tokens 50 \
     --skip-base \
-    --delta-conditions full_history_replay \
-    --full-history-mode official_prompt \
+    --delta-conditions official_prompt \
     --categories 1 2 3 4 \
     --output-json \
     outputs/locomo_osgm_checkpoint278.json \

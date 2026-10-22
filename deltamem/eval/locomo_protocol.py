@@ -27,11 +27,11 @@ CATEGORY_NAMES = {
 }
 
 ALL_LOCOMO_MECHANISMS = (
-    "full_history_replay",
+    "official_prompt",
 )
 
 DEFAULT_LOCOMO_MECHANISMS = (
-    "full_history_replay",
+    "official_prompt",
 )
 
 OFFICIAL_SYSTEM_PROMPT = (
@@ -249,77 +249,6 @@ def render_locomo_turn(dialog: dict) -> str:
         turn += f' and shared {dialog["blip_caption"]}.'
     turn += "\n"
     return turn
-
-
-def build_session_message(conversation: dict, session_num: int) -> dict[str, str]:
-    session_key = f"session_{session_num}"
-    date_key = f"{session_key}_date_time"
-    if session_key not in conversation or date_key not in conversation:
-        raise KeyError(f"Missing LoCoMo session keys for session {session_num}")
-    turns = "".join(render_locomo_turn(dialog) for dialog in conversation[session_key]).rstrip()
-    return {
-        "role": "user",
-        "content": f"DATE: {conversation[date_key]}\nCONVERSATION:\n{turns}",
-    }
-
-
-def build_turn_message(conversation: dict, session_num: int, dialog: dict) -> dict[str, str]:
-    session_key = f"session_{session_num}"
-    date_key = f"{session_key}_date_time"
-    if session_key not in conversation or date_key not in conversation:
-        raise KeyError(f"Missing LoCoMo session keys for session {session_num}")
-    return {
-        "role": "user",
-        "content": f"DATE: {conversation[date_key]}\nCONVERSATION:\n{render_locomo_turn(dialog).rstrip()}",
-    }
-
-
-def _build_locomo_session_message_groups(
-    sample: dict,
-    *,
-    message_granularity: str = "session",
-) -> list[list[dict[str, str]]]:
-    if message_granularity not in {"session", "turn"}:
-        raise ValueError(f"Unsupported LoCoMo history message granularity: {message_granularity}")
-
-    conversation = sample["conversation"]
-    session_groups: list[list[dict[str, str]]] = []
-    session_nums = sorted(
-        int(key.split("_")[-1])
-        for key in conversation
-        if key.startswith("session_") and not key.endswith("date_time")
-    )
-    for session_num in session_nums:
-        session_key = f"session_{session_num}"
-        session_turns = conversation[session_key]
-        if not session_turns:
-            continue
-        if message_granularity == "session":
-            session_groups.append([build_session_message(conversation, session_num)])
-            continue
-        session_groups.append(
-            [
-                build_turn_message(conversation, session_num, dialog)
-                for dialog in session_turns
-            ]
-        )
-    return session_groups
-
-
-def build_locomo_history_messages(
-    sample: dict,
-    *,
-    message_granularity: str = "session",
-) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": OFFICIAL_SYSTEM_PROMPT}
-    ]
-    for session_messages in _build_locomo_session_message_groups(
-        sample,
-        message_granularity=message_granularity,
-    ):
-        messages.extend(session_messages)
-    return messages
 
 
 def infer_model_context_window(model, tokenizer) -> int:

@@ -31,7 +31,6 @@ from deltamem.eval.locomo_protocol import (
     OFFICIAL_TOP_K,
     OFFICIAL_TOP_P,
     build_official_question_prompt,
-    build_locomo_history_messages,
     build_official_full_history_messages,
     canonicalize_locomo_prediction,
     infer_model_context_window,
@@ -44,12 +43,10 @@ from deltamem.core.delta import (
     HFDeltaMemConfig,
     attach_delta_mem,
     load_delta_mem_adapter,
-    load_delta_mem_online_state,
     reset_delta_mem_states,
-    set_delta_mem_write_enabled,
 )
 from deltamem.model_loading import DEFAULT_LOCAL_MODEL_PATH, resolve_attn_implementation
-from deltamem.runtime.session import DeltaMemChatSession, get_dtype
+from deltamem.runtime.session import get_dtype
 
 
 def _chat_template_input_ids(tokenizer, messages: list[dict[str, str]]) -> torch.Tensor:
@@ -157,19 +154,6 @@ def load_delta_model(
     return model, tokenizer, config
 
 
-def build_teacher_forced_snapshot(
-    model,
-    tokenizer,
-    device: str,
-    history: list[dict[str, str]],
-):
-    reset_delta_mem_states(model)
-    session = DeltaMemChatSession(model=model, tokenizer=tokenizer, device=device)
-    session.messages = [dict(message) for message in history]
-    full_ids = session._tokenize_messages(session.messages, add_generation_prompt=False)
-    session._ingest_full_ids(full_ids)
-    return session.snapshot()
-
 DEFAULT_DATA_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 DEFAULT_DATA_FILE = Path("data/locomo10.json")
 DEFAULT_MODEL_PATH = DEFAULT_LOCAL_MODEL_PATH
@@ -231,43 +215,14 @@ def parse_args() -> argparse.Namespace:
         choices=list(ALL_LOCOMO_MECHANISMS),
     )
     parser.add_argument(
-        "--full-history-mode",
-        default="history_replay",
-        choices=["official_prompt", "history_replay"],
-        help=(
-            "How to evaluate `full_history_replay`. `official_prompt` keeps the old LoCoMo-style "
-            "single-prompt generation. `history_replay` replays the full chat history so Delta-Mem "
-            "state is built from the same history messages used by the stateful conditions."
-        ),
-    )
-    parser.add_argument(
-        "--history-message-granularity",
-        default="session",
-        choices=["session", "turn"],
-        help=(
-            "How to chunk LoCoMo history for history-replay/stateful evaluation. `session` keeps one "
-            "message per LoCoMo session. `turn` splits each session into per-turn messages so cyclic "
-            "routing operates at a finer granularity."
-        ),
-    )
-    parser.add_argument(
-        "--history-replay-write-during-generation",
-        action="store_true",
-        help=(
-            "Keep Delta-Mem writes enabled while encoding the QA prompt and decoding the answer "
-            "in history_replay mode. By default, history_replay treats QA as a read-only probe "
-            "of the prebuilt history state."
-        ),
-    )
-    parser.add_argument(
-        "--history-do-sample",
+        "--official-do-sample",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Decode history-replay probes with sampling instead of greedy decoding.",
+        help="Decode official-prompt answers with sampling.",
     )
-    parser.add_argument("--history-temperature", type=float, default=0.4)
-    parser.add_argument("--history-top-p", type=float, default=0.9)
-    parser.add_argument("--history-top-k", type=int, default=10)
+    parser.add_argument("--official-temperature", type=float, default=OFFICIAL_TEMPERATURE)
+    parser.add_argument("--official-top-p", type=float, default=OFFICIAL_TOP_P)
+    parser.add_argument("--official-top-k", type=int, default=OFFICIAL_TOP_K)
     parser.add_argument(
         "--output-json",
         type=Path,
@@ -316,7 +271,10 @@ def build_sample_record(
             "speaker_a": sample["conversation"]["speaker_a"],
             "speaker_b": sample["conversation"]["speaker_b"],
         },
-        "num_sessions": len(build_locomo_history_messages(sample)) - 1,
+        "num_sessions": sum(
+            bool(value) for key, value in sample["conversation"].items()
+            if re.fullmatch(r"session_\d+", key)
+        ),
         "qa": [],
     }
     if supported_mechanisms is not None:
@@ -457,8 +415,7 @@ def generate_official_full_history_answer(
         answer_reserve_tokens=answer_reserve_tokens,
     )
     input_ids = _chat_template_input_ids(tokenizer, prompt_messages).to(device)
-    # Snapshot construction for other mechanisms mutates the model's online state.
-    # Reset here so full-history replay always starts from a clean state.
+    # Each official-prompt question starts with a clean online state.
     reset_delta_mem_states(model)
     rng_devices = []
     if torch.cuda.is_available() and device.startswith("cuda"):
@@ -497,216 +454,6 @@ def _format_eta(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _render_chat_prompt(tokenizer, messages: list[dict[str, str]]) -> str:
-    return cast(
-        str,
-        apply_project_chat_template(
-            tokenizer,
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        ),
-    )
-
-
-def _stack_delta_states(delta_states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    if not delta_states:
-        return {}
-    keys = tuple(delta_states[0].keys())
-    return {
-        key: torch.cat([state[key] for state in delta_states], dim=0)
-        for key in keys
-    }
-
-
-def _slice_delta_state(
-    delta_state: dict[str, torch.Tensor] | None,
-    start: int,
-    end: int,
-) -> dict[str, torch.Tensor] | None:
-    if delta_state is None:
-        return None
-    return {
-        key: value[start:end].contiguous()
-        for key, value in delta_state.items()
-    }
-
-
-def _generate_prompt_chunk(
-    *,
-    model,
-    tokenizer,
-    device: str,
-    message_batches: list[list[dict[str, str]]],
-    max_new_tokens: int,
-    do_sample: bool,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    batch_seed: int,
-    delta_state: dict[str, torch.Tensor] | None,
-    write_during_generation: bool,
-) -> list[str]:
-    rendered_prompts = [_render_chat_prompt(tokenizer, messages) for messages in message_batches]
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    old_padding_side = getattr(tokenizer, "padding_side", "right")
-    tokenizer.padding_side = "left"
-    try:
-        tokenized = tokenizer(
-            rendered_prompts,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,
-        )
-    finally:
-        tokenizer.padding_side = old_padding_side
-
-    input_ids = tokenized.input_ids.to(device)
-    attention_mask = getattr(tokenized, "attention_mask", None)
-    if attention_mask is None:
-        attention_mask = input_ids.new_ones(input_ids.shape)
-    else:
-        attention_mask = attention_mask.to(device)
-
-    reset_delta_mem_states(model)
-    if delta_state:
-        load_delta_mem_online_state(model, delta_state)
-
-    rng_devices = []
-    if torch.cuda.is_available() and device.startswith("cuda"):
-        rng_devices = [torch.device(device)]
-
-    set_delta_mem_write_enabled(model, bool(write_during_generation))
-    try:
-        with torch.random.fork_rng(devices=rng_devices):
-            torch.manual_seed(batch_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(batch_seed)
-            with torch.inference_mode():
-                generate_kwargs = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "do_sample": do_sample,
-                    "max_new_tokens": max_new_tokens,
-                    "use_cache": True,
-                }
-                if tokenizer.pad_token_id is not None:
-                    generate_kwargs["pad_token_id"] = tokenizer.pad_token_id
-                if do_sample:
-                    generate_kwargs["top_k"] = OFFICIAL_TOP_K if top_k in (None, 0) else int(top_k)
-                    generate_kwargs["top_p"] = OFFICIAL_TOP_P if top_p is None else float(top_p)
-                    generate_kwargs["temperature"] = (
-                        OFFICIAL_TEMPERATURE if temperature is None else float(temperature)
-                    )
-                outputs = model.generate(**generate_kwargs)
-    finally:
-        set_delta_mem_write_enabled(model, True)
-
-    generated_ids = outputs[:, input_ids.shape[1] :]
-    return [tokenizer.decode(row, skip_special_tokens=True).strip() for row in generated_ids]
-
-
-def _batched_generate_raw_predictions(
-    *,
-    model,
-    tokenizer,
-    device: str,
-    message_batches: list[list[dict[str, str]]],
-    max_new_tokens: int,
-    do_sample: bool,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    batch_seed: int,
-    delta_state: dict[str, torch.Tensor] | None,
-    write_during_generation: bool,
-) -> list[str]:
-    if not message_batches:
-        return []
-    try:
-        return _generate_prompt_chunk(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            message_batches=message_batches,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            batch_seed=batch_seed,
-            delta_state=delta_state,
-            write_during_generation=write_during_generation,
-        )
-    except torch.OutOfMemoryError:
-        if len(message_batches) == 1:
-            raise
-        maybe_empty_cache(device)
-        split = len(message_batches) // 2
-        print(
-            f"[locomo_delta] CUDA OOM at batch size {len(message_batches)}; retrying with {split} + {len(message_batches) - split}",
-            flush=True,
-        )
-        first = _batched_generate_raw_predictions(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            message_batches=message_batches[:split],
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            batch_seed=batch_seed,
-            delta_state=_slice_delta_state(delta_state, 0, split),
-            write_during_generation=write_during_generation,
-        )
-        second = _batched_generate_raw_predictions(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            message_batches=message_batches[split:],
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            batch_seed=batch_seed + split,
-            delta_state=_slice_delta_state(delta_state, split, len(message_batches)),
-            write_during_generation=write_during_generation,
-        )
-        return first + second
-
-
-def _build_sample_cache(
-    *,
-    model,
-    tokenizer,
-    device: str,
-    sample: dict,
-    condition_names: list[str],
-    history_message_granularity: str,
-    full_history_mode: str,
-) -> dict[str, object]:
-    cache: dict[str, object] = {"sample": sample}
-    if full_history_mode == "history_replay" and "full_history_replay" in condition_names:
-        history_messages = build_locomo_history_messages(
-            sample,
-            message_granularity=history_message_granularity,
-        )
-        cache["history_messages"] = history_messages
-        if not getattr(build_teacher_forced_snapshot, "question_aware", False):
-            cache["full_snapshot"] = build_teacher_forced_snapshot(
-                model,
-                tokenizer,
-                device,
-                history_messages,
-            )
-
-    return cache
-
-
 def evaluate_locomo_conditions(
     *,
     model,
@@ -718,173 +465,61 @@ def evaluate_locomo_conditions(
     max_new_tokens: int,
     seed: int,
     answer_reserve_tokens: int,
-    full_history_mode: str,
-    history_message_granularity: str,
-    history_do_sample: bool,
-    history_temperature: float,
-    history_top_p: float,
-    history_top_k: int,
-    history_replay_write_during_generation: bool,
+    official_do_sample: bool,
+    official_temperature: float,
+    official_top_p: float,
+    official_top_k: int,
     eval_batch_size: int,
     progress_bar: Any = None,
     progress_jsonl: Path | None = None,
 ) -> list[tuple[int, int, dict[str, object]]]:
+    if condition_names != ["official_prompt"]:
+        raise ValueError(f"Only the official LoCoMo prompt is supported: {condition_names}")
     records: list[tuple[int, int, dict[str, object]]] = []
-    sample_cache: dict[int, dict[str, object]] = {}
     started_at = time.perf_counter()
     total_tasks = len(question_tasks)
     effective_batch_size = max(1, int(eval_batch_size))
-    max_context_tokens = None
-    if full_history_mode == "official_prompt" and "full_history_replay" in condition_names:
-        max_context_tokens = infer_model_context_window(model, tokenizer)
 
     for batch_start in range(0, total_tasks, effective_batch_size):
         batch_tasks = question_tasks[batch_start : batch_start + effective_batch_size]
-        batch_items: list[dict[str, object]] = []
         for _, sample_idx, question_idx in batch_tasks:
             sample = samples[sample_idx]
-            if sample_idx not in sample_cache:
-                sample_cache[sample_idx] = _build_sample_cache(
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    sample=sample,
-                    condition_names=condition_names,
-                    history_message_granularity=history_message_granularity,
-                    full_history_mode=full_history_mode,
-                )
-            cache = sample_cache[sample_idx]
             qa = sample["qa"][question_idx]
-            question_spec = prepare_locomo_question(
+            raw_prediction, prediction = generate_official_full_history_answer(
+                model,
+                tokenizer,
+                device,
+                sample,
                 qa,
-                sample_id=str(sample["sample_id"]),
                 question_index=question_idx,
                 seed=seed,
+                max_new_tokens=max_new_tokens,
+                answer_reserve_tokens=answer_reserve_tokens,
+                do_sample=official_do_sample,
+                temperature=official_temperature,
+                top_p=official_top_p,
+                top_k=official_top_k,
             )
-            batch_items.append(
-                {
-                    "sample_idx": sample_idx,
-                    "question_idx": question_idx,
-                    "sample": sample,
-                    "qa": qa,
-                    "cache": cache,
-                    "question_spec": question_spec,
-                    "question_prompt": build_official_question_prompt(question_spec),
-                    "qa_record": {
-                        "question": qa["question"],
-                        "answer": qa.get("answer"),
-                        "adversarial_answer": qa.get("adversarial_answer"),
-                        "evidence": list(qa.get("evidence", [])),
-                        "category": int(qa["category"]),
-                        "conditions": {},
-                    },
-                }
-            )
-
-        for condition_offset, condition_name in enumerate(condition_names):
-            if condition_name == "full_history_replay" and full_history_mode == "official_prompt":
-                for item in batch_items:
-                    qa = cast(dict, item["qa"])
-                    question_spec = cast(Any, item["question_spec"])
-                    question_idx = cast(int, item["question_idx"])
-                    sample = cast(dict, item["sample"])
-                    raw_prediction, prediction = generate_official_full_history_answer(
-                        model,
-                        tokenizer,
-                        device,
-                        sample,
-                        qa,
-                        question_index=question_idx,
-                        seed=seed,
-                        max_new_tokens=max_new_tokens,
-                        answer_reserve_tokens=answer_reserve_tokens,
-                        do_sample=history_do_sample,
-                        temperature=history_temperature,
-                        top_p=history_top_p,
-                        top_k=history_top_k,
-                    )
-                    cast(dict[str, object], cast(dict[str, object], item["qa_record"])["conditions"])[condition_name] = {
+            qa_record: dict[str, object] = {
+                "question": qa["question"],
+                "answer": qa.get("answer"),
+                "adversarial_answer": qa.get("adversarial_answer"),
+                "evidence": list(qa.get("evidence", [])),
+                "category": int(qa["category"]),
+                "conditions": {
+                    "official_prompt": {
                         "prediction": prediction,
                         "raw_prediction": raw_prediction,
                         "score": round(score_locomo_prediction(qa, prediction), 4),
                         "turn_stats": {
                             "official_aligned": True,
                             "answer_reserve_tokens": answer_reserve_tokens,
-                            "condition_name": condition_name,
-                            "full_history_mode": full_history_mode,
-                            "history_message_granularity": history_message_granularity,
+                            "condition_name": "official_prompt",
+                            "full_history_mode": "official_prompt",
                         },
                     }
-                continue
-
-            message_batches: list[list[dict[str, str]]] = []
-            delta_states: list[dict[str, torch.Tensor]] = []
-            use_delta_state = False
-
-            for item in batch_items:
-                cache = cast(dict[str, object], item["cache"])
-                question_prompt = cast(str, item["question_prompt"])
-                if condition_name == "full_history_replay":
-                    snapshot = cast(Any, cache.get("full_snapshot"))
-                    history_messages = cast(list[dict[str, str]], cache["history_messages"])
-                    if snapshot is None and getattr(build_teacher_forced_snapshot, "question_aware", False):
-                        snapshot = build_teacher_forced_snapshot(
-                            model,
-                            tokenizer,
-                            device,
-                            history_messages,
-                            question_prompt,
-                        )
-                    prompt_messages = history_messages + [{"role": "user", "content": question_prompt}]
-                    if snapshot is not None and getattr(snapshot, "delta_state", None):
-                        use_delta_state = True
-                        delta_states.append(cast(dict[str, torch.Tensor], snapshot.delta_state))
-                else:
-                    raise ValueError(f"Unsupported LoCoMo condition: {condition_name}")
-                message_batches.append(prompt_messages)
-
-            delta_state = _stack_delta_states(delta_states) if use_delta_state else None
-            raw_predictions = _batched_generate_raw_predictions(
-                model=model,
-                tokenizer=tokenizer,
-                device=device,
-                message_batches=message_batches,
-                max_new_tokens=max_new_tokens,
-                do_sample=history_do_sample,
-                temperature=history_temperature,
-                top_p=history_top_p,
-                top_k=history_top_k,
-                batch_seed=seed + batch_start + (condition_offset * 100003),
-                delta_state=delta_state,
-                write_during_generation=(
-                    full_history_mode == "history_replay"
-                    and history_replay_write_during_generation
-                ),
-            )
-
-            for item, raw_prediction in zip(batch_items, raw_predictions):
-                qa = cast(dict, item["qa"])
-                question_spec = cast(Any, item["question_spec"])
-                prediction = canonicalize_locomo_prediction(raw_prediction, question_spec)
-                turn_stats: dict[str, object] = {
-                    "batched_eval": True,
-                    "eval_batch_size": len(batch_items),
-                    "condition_name": condition_name,
-                    "full_history_mode": full_history_mode,
-                    "history_message_granularity": history_message_granularity,
-                }
-                cast(dict[str, object], cast(dict[str, object], item["qa_record"])["conditions"])[condition_name] = {
-                    "prediction": prediction,
-                    "raw_prediction": raw_prediction,
-                    "score": round(score_locomo_prediction(qa, prediction), 4),
-                    "turn_stats": turn_stats,
-                }
-
-        for item in batch_items:
-            sample_idx = cast(int, item["sample_idx"])
-            question_idx = cast(int, item["question_idx"])
-            sample = cast(dict, item["sample"])
-            qa_record = cast(dict[str, object], item["qa_record"])
+                },
+            }
             records.append((sample_idx, question_idx, qa_record))
             if progress_jsonl is not None:
                 append_jsonl(
@@ -900,16 +535,15 @@ def evaluate_locomo_conditions(
                 )
 
         if progress_bar is not None:
-            completed = batch_start + len(batch_items)
+            completed = batch_start + len(batch_tasks)
             elapsed = time.perf_counter() - started_at
             avg_seconds = elapsed / max(completed, 1)
-            remaining = max(total_tasks - completed, 0)
-            eta_seconds = avg_seconds * remaining
+            eta_seconds = avg_seconds * max(total_tasks - completed, 0)
             progress_bar.set_postfix_str(
-                f"avg={avg_seconds:.1f}s/q eta={_format_eta(eta_seconds)} batch={len(batch_items)}",
+                f"avg={avg_seconds:.1f}s/q eta={_format_eta(eta_seconds)} batch={len(batch_tasks)}",
                 refresh=True,
             )
-            progress_bar.update(len(batch_items))
+            progress_bar.update(len(batch_tasks))
     return records
 
 
@@ -959,14 +593,12 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "seed": args.seed,
             "answer_reserve_tokens": args.answer_reserve_tokens,
-            "full_history_mode": args.full_history_mode,
-            "history_message_granularity": args.history_message_granularity,
-            "history_replay_write_during_generation": args.history_replay_write_during_generation,
-            "history_decode": {
-                "do_sample": args.history_do_sample,
-                "temperature": args.history_temperature,
-                "top_p": args.history_top_p,
-                "top_k": args.history_top_k,
+            "full_history_mode": "official_prompt",
+            "official_decode": {
+                "do_sample": args.official_do_sample,
+                "temperature": args.official_temperature,
+                "top_p": args.official_top_p,
+                "top_k": args.official_top_k,
             },
         }
 
@@ -981,7 +613,7 @@ def main() -> None:
                 dtype=args.dtype,
                 attn_implementation=args.attn_implementation,
             )
-            base_condition_names = ["full_history_replay"]
+            base_condition_names = ["official_prompt"]
             base_records_local = evaluate_locomo_conditions(
                 model=base_model,
                 tokenizer=base_tokenizer,
@@ -992,13 +624,10 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 seed=args.seed,
                 answer_reserve_tokens=args.answer_reserve_tokens,
-                full_history_mode=args.full_history_mode,
-                history_message_granularity=args.history_message_granularity,
-                history_do_sample=args.history_do_sample,
-                history_temperature=args.history_temperature,
-                history_top_p=args.history_top_p,
-                history_top_k=args.history_top_k,
-                history_replay_write_during_generation=args.history_replay_write_during_generation,
+                official_do_sample=args.official_do_sample,
+                official_temperature=args.official_temperature,
+                official_top_p=args.official_top_p,
+                official_top_k=args.official_top_k,
                 eval_batch_size=args.eval_batch_size,
                 progress_bar=progress_bar,
                 progress_jsonl=progress_jsonl,
@@ -1067,13 +696,10 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 seed=args.seed,
                 answer_reserve_tokens=args.answer_reserve_tokens,
-                full_history_mode=args.full_history_mode,
-                history_message_granularity=args.history_message_granularity,
-                history_do_sample=args.history_do_sample,
-                history_temperature=args.history_temperature,
-                history_top_p=args.history_top_p,
-                history_top_k=args.history_top_k,
-                history_replay_write_during_generation=args.history_replay_write_during_generation,
+                official_do_sample=args.official_do_sample,
+                official_temperature=args.official_temperature,
+                official_top_p=args.official_top_p,
+                official_top_k=args.official_top_k,
                 eval_batch_size=args.eval_batch_size,
                 progress_bar=progress_bar,
                 progress_jsonl=progress_jsonl,

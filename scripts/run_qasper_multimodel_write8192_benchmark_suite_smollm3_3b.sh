@@ -141,7 +141,6 @@ run_locomo_base_like() {
     --seed 42 \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     --answer-reserve-tokens 50 \
-    --full-history-mode official_prompt \
     --categories 1 2 3 4 \
     --output-json "${output_json}" \
     --data-file "${LOCOMO_DATA_FILE}"
@@ -174,8 +173,7 @@ run_locomo_delta_only() {
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     --answer-reserve-tokens 50 \
     --skip-base \
-    --delta-conditions full_history_replay \
-    --full-history-mode official_prompt \
+    --delta-conditions official_prompt \
     --categories 1 2 3 4 \
     --output-json "${output_json}" \
     --data-file "${LOCOMO_DATA_FILE}"
