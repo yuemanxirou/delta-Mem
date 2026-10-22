@@ -23,7 +23,7 @@ from deltamem.core.delta import (
     set_delta_mem_write_message_ids,
     set_delta_mem_write_sentence_ids,
 )
-from deltamem.core.write_segmentation import split_text_into_sentence_token_chunks
+from deltamem.core.write_segmentation import _SENTENCE_BOUNDARY_RE
 
 
 def get_dtype(name: str) -> torch.dtype:
@@ -117,22 +117,28 @@ def _sentence_ids_for_message_delta(
     content_start = _find_subsequence_start(delta_ids, content_ids)
     if content_start is None:
         return sentence_ids, next_sentence_id
-    sentence_chunks = split_text_into_sentence_token_chunks(message_content)
-    sentence_chunk_ids = [
-        _tokenize_text_no_special_tokens(tokenizer, sentence_chunk)
-        for sentence_chunk in sentence_chunks
-    ]
-    flat_sentence_ids = [token_id for chunk_ids in sentence_chunk_ids for token_id in chunk_ids]
-    if flat_sentence_ids != content_ids:
+    # Keep boundary whitespace/newlines with the preceding unit so the
+    # concatenated tokenization remains aligned with the original message.
+    try:
+        encoded = tokenizer(
+            message_content,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        aligned_ids = list(encoded["input_ids"])
+        offsets = list(encoded["offset_mapping"])
+    except (TypeError, KeyError, NotImplementedError):
+        aligned_ids, offsets = [], []
+    if aligned_ids != content_ids or len(offsets) != len(content_ids):
         sentence_ids[content_start : content_start + len(content_ids)] = [next_sentence_id] * len(content_ids)
         return sentence_ids, next_sentence_id + 1
-    position = content_start
-    for chunk_ids in sentence_chunk_ids:
-        if not chunk_ids:
-            continue
-        sentence_ids[position : position + len(chunk_ids)] = [next_sentence_id] * len(chunk_ids)
-        position += len(chunk_ids)
-        next_sentence_id += 1
+    boundaries = [match.end() for match in _SENTENCE_BOUNDARY_RE.finditer(message_content)]
+    boundary_index = 0
+    for token_index, (start, end) in enumerate(offsets):
+        while boundary_index < len(boundaries) and start >= boundaries[boundary_index]:
+            boundary_index += 1
+        sentence_ids[content_start + token_index] = next_sentence_id + boundary_index
+    next_sentence_id += len(boundaries) + 1
     return sentence_ids, next_sentence_id
 
 

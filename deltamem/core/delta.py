@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
 from deltamem.core.backbone_compat import SmolLM3Attention, ensure_attention_compat_views
+_DELTA_MEM_IMPL = os.environ.get("DELTA_MEM_IMPL", "default").strip().lower()
+_SSW_IMPLS = {"ssw", "delta_impl_ssw"}
+_SSW_CE_WEIGHTED_IMPLS = {"ssw_ce_weighted", "ce_ssw", "delta_impl_ce_ssw"}
+_SSW_SURPRISAL_IMPLS = {"ssw_surprisal", "surprisal_ssw", "delta_impl_ssw_surprisal"}
+_SENTENCE_SSW_IMPLS = {"sentence_ssw", "ssw_sentence", "delta_impl_sentence_ssw"}
+if _DELTA_MEM_IMPL in {"", "default", "delta", "delta_impl"}:
+    from deltamem.core import delta_impl as _implementation
+elif _DELTA_MEM_IMPL in _SSW_IMPLS:
+    from deltamem.core import delta_impl_ssw as _implementation
+elif _DELTA_MEM_IMPL in _SSW_CE_WEIGHTED_IMPLS:
+    from deltamem.core import delta_impl_ssw_ce_weighted as _implementation
+elif _DELTA_MEM_IMPL in _SSW_SURPRISAL_IMPLS:
+    from deltamem.core import delta_impl_ssw_surprisal as _implementation
+elif _DELTA_MEM_IMPL in _SENTENCE_SSW_IMPLS:
+    from deltamem.core import delta_impl_sentence_ssw as _implementation
+else:
+    raise ValueError(
+            "Unsupported DELTA_MEM_IMPL={!r}; expected default, ssw, ssw_ce_weighted, ssw_surprisal, or sentence_ssw".format(_DELTA_MEM_IMPL)
+    )
+
 from deltamem.core.delta_impl import (
     VALID_DELTA_HEADS,
     VALID_MEMORY_PARTITION_BASIS,
@@ -34,8 +55,12 @@ from deltamem.core.delta_impl import (
     set_delta_mem_write_sentence_ids,
     snapshot_delta_mem_weights,
     HFDeltaMemConfig as ExperimentalHFDeltaMemConfig,
-    DeltaMemAttention as ExperimentalDeltaMemAttention,
 )
+
+# The common helpers above intentionally remain imported from delta_impl for
+# backwards compatibility.  The implementation-specific attention wrapper
+# and attachment function are selected through DELTA_MEM_IMPL.
+ExperimentalDeltaMemAttention = _implementation.DeltaMemAttention
 
 VALID_MEMORY_READOUT_MODES = ("delta",)
 
@@ -61,13 +86,18 @@ class HFDeltaMemConfig(ExperimentalHFDeltaMemConfig):
             )
 
 
-class DeltaMemAttention(ExperimentalDeltaMemAttention):
-    def __init__(self, base: Qwen3Attention | SmolLM3Attention, config: HFDeltaMemConfig) -> None:
-        if config.memory_readout_mode != "delta":
-            raise ValueError(
-                "Mainline DeltaMemAttention only supports memory_readout_mode='delta'."
-            )
-        super().__init__(base, config)
+if _DELTA_MEM_IMPL in _SSW_IMPLS | _SSW_CE_WEIGHTED_IMPLS | _SSW_SURPRISAL_IMPLS | _SENTENCE_SSW_IMPLS:
+    # Expose the selected implementation class so isinstance checks used by
+    # training/evaluation utilities continue to match wrapped modules.
+    DeltaMemAttention = ExperimentalDeltaMemAttention
+else:
+    class DeltaMemAttention(ExperimentalDeltaMemAttention):
+        def __init__(self, base: Qwen3Attention | SmolLM3Attention, config: HFDeltaMemConfig) -> None:
+            if config.memory_readout_mode != "delta":
+                raise ValueError(
+                    "Mainline DeltaMemAttention only supports memory_readout_mode='delta'."
+                )
+            super().__init__(base, config)
 
 
 def _get_parent_module(root, module_name: str):
@@ -83,6 +113,8 @@ def attach_delta_mem(model, config: HFDeltaMemConfig) -> list[str]:
         raise ValueError(
             "attach_delta_mem in mainline only supports memory_readout_mode='delta'."
         )
+    if _DELTA_MEM_IMPL in _SSW_IMPLS | _SSW_CE_WEIGHTED_IMPLS | _SSW_SURPRISAL_IMPLS | _SENTENCE_SSW_IMPLS:
+        return _implementation.attach_delta_mem(model, config)
     replaced = []
     for name, module in list(model.named_modules()):
         if not isinstance(module, (Qwen3Attention, SmolLM3Attention)):

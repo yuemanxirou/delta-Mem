@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import inspect
 import json
@@ -16,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
 from deltamem.core.delta import (
     HFDeltaMemConfig,
@@ -31,6 +32,7 @@ from deltamem.core.delta import (
     get_delta_mem_write_regularization,
     iter_delta_mem_modules,
     load_delta_mem_online_state,
+    load_delta_mem_adapter,
     normalize_delta_heads,
     normalize_memory_readout_mode,
     normalize_state_update_mode,
@@ -44,6 +46,125 @@ from deltamem.core.delta import (
 from deltamem.chat_templates import apply_chat_template as apply_project_chat_template
 from deltamem.model_loading import resolve_attn_implementation
 from deltamem.core.write_segmentation import split_text_into_sentence_token_chunks
+
+
+_SEMANTIC_ENCODER = None
+_SEMANTIC_TOKENIZER = None
+_SEMANTIC_DEVICE = "cpu"
+_SEMANTIC_PERCENTILE = 65.0
+_SEMANTIC_MAX_CHUNK_TOKENS = 512
+_SEMANTIC_SELECTION_BUDGET = 8192
+
+
+def configure_semantic_encoder(
+    model_path: str,
+    *,
+    percentile: float,
+    max_chunk_tokens: int,
+    selection_budget: int,
+) -> None:
+    """Load the frozen sentence encoder used during dataset preprocessing."""
+    global _SEMANTIC_ENCODER, _SEMANTIC_TOKENIZER
+    global _SEMANTIC_PERCENTILE, _SEMANTIC_MAX_CHUNK_TOKENS, _SEMANTIC_SELECTION_BUDGET
+    _SEMANTIC_TOKENIZER = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    _SEMANTIC_ENCODER = AutoModel.from_pretrained(model_path, local_files_only=True)
+    _SEMANTIC_ENCODER.eval().to("cpu")
+    for parameter in _SEMANTIC_ENCODER.parameters():
+        parameter.requires_grad_(False)
+    _SEMANTIC_PERCENTILE = float(percentile)
+    _SEMANTIC_MAX_CHUNK_TOKENS = int(max_chunk_tokens)
+    _SEMANTIC_SELECTION_BUDGET = int(selection_budget)
+
+
+@torch.no_grad()
+def _encode_semantic_texts(texts: list[str]) -> torch.Tensor:
+    if _SEMANTIC_ENCODER is None or _SEMANTIC_TOKENIZER is None:
+        raise RuntimeError("embedding_semantic requires --semantic-model-path")
+    if not texts:
+        return torch.empty((0, 1), dtype=torch.float32)
+    outputs = []
+    for start in range(0, len(texts), 32):
+        batch = _SEMANTIC_TOKENIZER(
+            texts[start : start + 32],
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        )
+        hidden = _SEMANTIC_ENCODER(**batch).last_hidden_state.float()
+        mask = batch["attention_mask"].unsqueeze(-1).float()
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        outputs.append(F.normalize(pooled, dim=-1))
+    return torch.cat(outputs, dim=0)
+
+
+def _semantic_ids_for_tokenized_messages(
+    tokenizer,
+    messages: list[dict[str, str]],
+    full_input_ids: list[int],
+    sentence_ids: list[int],
+    *,
+    question: str | None,
+) -> list[int]:
+    """Return token-aligned semantic group IDs, with unselected groups masked."""
+    sentence_texts: list[str] = []
+    for message in messages:
+        if message["role"] != "system":
+            sentence_texts.extend(split_text_into_sentence_token_chunks(message["content"]))
+    ordered_sentence_ids = sorted({value for value in sentence_ids if value >= 0})
+    if not ordered_sentence_ids:
+        return [-1] * len(full_input_ids)
+    if len(sentence_texts) != len(ordered_sentence_ids):
+        # Chat-template alignment can omit empty sentence fragments. Fall back to
+        # the aligned sentence units; this remains deterministic and safe.
+        sentence_texts = sentence_texts[: len(ordered_sentence_ids)]
+    embeddings = _encode_semantic_texts(sentence_texts)
+    if embeddings.size(0) != len(ordered_sentence_ids):
+        return [-1] * len(full_input_ids)
+    if embeddings.size(0) == 1:
+        distances = torch.empty(0)
+    else:
+        distances = 1.0 - (embeddings[:-1] * embeddings[1:]).sum(dim=-1)
+    cutoff = float(torch.quantile(distances, _SEMANTIC_PERCENTILE / 100.0).item()) if distances.numel() else float("inf")
+    token_counts = [sum(value == sentence_id for value in sentence_ids) for sentence_id in ordered_sentence_ids]
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_tokens = 0
+    for index, token_count in enumerate(token_counts):
+        if current and (current_tokens + token_count > _SEMANTIC_MAX_CHUNK_TOKENS or distances[index - 1].item() >= cutoff):
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(index)
+        current_tokens += token_count
+    if current:
+        groups.append(current)
+    sentence_to_group = {}
+    for group_id, group in enumerate(groups):
+        for index in group:
+            sentence_to_group[ordered_sentence_ids[index]] = group_id
+
+    if question and groups:
+        question_embedding = _encode_semantic_texts([question])[0]
+        scores = []
+        for group in groups:
+            weights = torch.tensor([token_counts[index] for index in group], dtype=torch.float32)
+            group_embedding = (embeddings[group] * weights.unsqueeze(-1)).sum(dim=0) / weights.sum().clamp_min(1.0)
+            scores.append(float(torch.dot(F.normalize(group_embedding, dim=0), question_embedding).item()))
+        ranked = sorted(range(len(groups)), key=lambda group_id: scores[group_id], reverse=True)
+        selected: set[int] = set()
+        used_tokens = 0
+        for group_id in ranked:
+            group_tokens = sum(token_counts[index] for index in groups[group_id])
+            if selected and used_tokens + group_tokens > _SEMANTIC_SELECTION_BUDGET:
+                continue
+            selected.add(group_id)
+            used_tokens += group_tokens
+        sentence_to_group = {
+            sentence_id: group_id if group_id in selected else -1
+            for sentence_id, group_id in sentence_to_group.items()
+        }
+    return [sentence_to_group.get(value, -1) if value >= 0 else -1 for value in sentence_ids]
 
 class _AccelerateKernelWarningFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -112,6 +233,8 @@ class DeltaMemTrainer(Trainer):
         context_ablation_mode: str = "mixed",
         context_ablation_no_state_prob: float = 0.2,
         context_ablation_state_only_prob: float = 0.2,
+        autocompressor_offload_activations: bool = False,
+        autocompressor_loss_weight: float = 0.1,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -142,6 +265,8 @@ class DeltaMemTrainer(Trainer):
         self.context_ablation_mode = context_ablation_mode
         self.context_ablation_no_state_prob = context_ablation_no_state_prob
         self.context_ablation_state_only_prob = context_ablation_state_only_prob
+        self.autocompressor_offload_activations = autocompressor_offload_activations
+        self.autocompressor_loss_weight = autocompressor_loss_weight
         self._last_write_sparsity_loss = 0.0
         self._last_memory_keep_loss = 0.0
         self._last_memory_reset_loss = 0.0
@@ -176,6 +301,15 @@ class DeltaMemTrainer(Trainer):
         self._last_partition_write_route_balance_l2 = 0.0
         self._last_partition_read_route_balance_l2 = 0.0
         self._ddp_static_graph_initialized = False
+        self._last_autocompressor_ce = 0.0
+        self._last_autocompressor_sft_ce = 0.0
+        self._last_autocompressor_tokens = 0.0
+        self._last_autocompressor_segments = 0.0
+        self._last_autocompressor_segment_length = 0.0
+        self._last_autocompressor_seconds = 0.0
+        self._last_autocompressor_state_norm = 0.0
+        self._last_autocompressor_message_count = 0.0
+        self._last_autocompressor_message_tokens = 0.0
 
     def _maybe_enable_static_graph(self, model) -> None:
         if self._ddp_static_graph_initialized:
@@ -190,6 +324,491 @@ class DeltaMemTrainer(Trainer):
         set_delta_mem_write_message_ids(model, None)
         set_delta_mem_write_sentence_ids(model, None)
         set_delta_mem_write_enabled(model, True)
+
+    def _compute_autocompressor_ssw_loss(
+        self,
+        model,
+        model_inputs: dict[str, torch.Tensor],
+    ):
+        """Run a document as sequential fixed-size SSW segments.
+
+        The synthetic boundary token gives the first document token in each
+        segment a causal-logit position.  It is never included in the SSW
+        proposal mean.  The state is intentionally left attached between
+        segment forwards so later CE trains earlier segment writes.
+        """
+        input_ids = model_inputs["autocompressor_input_ids"]
+        attention_mask = model_inputs["autocompressor_attention_mask"]
+        segment_length = int(model_inputs["autocompressor_segment_length"].item())
+        boundary_id = int(model_inputs["autocompressor_boundary_token_id"].item())
+        if input_ids.size(0) != 1:
+            raise ValueError(
+                "autocompressor_ssw currently requires per-device batch size 1 "
+                "because each sample has an independent state trajectory"
+            )
+        if segment_length <= 0:
+            raise ValueError("autocompressor segment length must be positive")
+
+        started_at = time.perf_counter()
+        self._reset_online_state(model)
+        set_delta_mem_read_context_mask(model, None)
+        set_delta_mem_write_enabled(model, True)
+        total_nll = None
+        total_tokens = 0
+        segment_count = 0
+        last_outputs = None
+        sequence_length = int(input_ids.size(1))
+        for start, end in build_autocompressor_segment_slices(
+            sequence_length, segment_length
+        ):
+            raw_ids = input_ids[:, start:end]
+            raw_mask = attention_mask[:, start:end].bool()
+            if not raw_mask.any():
+                continue
+
+            if boundary_id is None:
+                raise ValueError("AutoCompressor-SSW requires bos_token_id or eos_token_id")
+            boundary = raw_ids.new_full((1, 1), int(boundary_id))
+            segment_ids = torch.cat((boundary, raw_ids), dim=1)
+            segment_attention = torch.cat(
+                (torch.ones((1, 1), dtype=attention_mask.dtype, device=attention_mask.device),
+                 raw_mask.to(dtype=attention_mask.dtype)),
+                dim=1,
+            )
+            segment_labels = torch.cat(
+                (raw_ids.new_full((1, 1), -100), raw_ids.masked_fill(~raw_mask, -100)),
+                dim=1,
+            )
+            # -1 excludes the synthetic boundary and padded positions from
+            # _build_message_write_means; 0 makes the complete segment one
+            # SSW proposal.
+            write_ids = raw_ids.new_full((1, end - start + 1), -1)
+            write_ids[:, 1:] = torch.where(
+                raw_mask,
+                torch.zeros_like(raw_mask, dtype=write_ids.dtype),
+                torch.full_like(raw_mask, -1, dtype=write_ids.dtype),
+            )
+            set_delta_mem_write_message_ids(model, write_ids)
+            set_delta_mem_write_sentence_ids(model, None)
+            try:
+                outputs = model(
+                    input_ids=segment_ids,
+                    attention_mask=segment_attention,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            finally:
+                set_delta_mem_write_message_ids(model, None)
+            logits = outputs.logits
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = segment_labels[:, 1:].contiguous()
+            valid_labels = shift_labels.ne(-100)
+            token_count = int(valid_labels.sum().item())
+            if token_count == 0:
+                continue
+            segment_nll = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_nll = segment_nll if total_nll is None else total_nll + segment_nll
+            total_tokens += token_count
+            segment_count += 1
+            last_outputs = outputs
+            for _, module in iter_delta_mem_modules(model):
+                if module.delta_state is not None and not torch.isfinite(module.delta_state).all():
+                    raise FloatingPointError(
+                        f"Non-finite AutoCompressor-SSW state after segment {segment_count}"
+                    )
+
+        if total_nll is None or total_tokens == 0:
+            raise ValueError("AutoCompressor-SSW received an empty training sequence")
+        loss = total_nll / total_tokens
+        elapsed = time.perf_counter() - started_at
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite AutoCompressor-SSW loss: {float(loss.detach().float().item())}"
+            )
+        self._last_autocompressor_ce = float(loss.detach().float().item())
+        self._last_autocompressor_tokens = float(total_tokens)
+        self._last_autocompressor_segments = float(segment_count)
+        self._last_autocompressor_segment_length = float(segment_length)
+        self._last_autocompressor_seconds = float(elapsed)
+        state_stats = collect_delta_mem_state_stats(model)
+        self._last_autocompressor_state_norm = float(state_stats["mean_state_norm"])
+        self._last_memory_keep_loss = self._last_autocompressor_ce
+        self._last_memory_full_ce_loss = self._last_autocompressor_ce
+        self._last_memory_wmem = 1.0
+        set_delta_mem_read_context_mask(model, None)
+        set_delta_mem_write_message_ids(model, None)
+        set_delta_mem_write_sentence_ids(model, None)
+        set_delta_mem_write_enabled(model, True)
+        return loss, {
+            "loss": loss.detach(),
+            "logits": last_outputs.logits if last_outputs is not None else None,
+        }
+
+    def _compute_autocompressor_episode_loss(
+        self,
+        model,
+        model_inputs: dict[str, torch.Tensor],
+    ):
+        """Jointly train history compression and final assistant prediction.
+
+        The fixed-token mode supplies no session ids.  The session-level mode
+        supplies explicit contiguous session ids, making each session one
+        causal segment.  Each segment is scored from the state produced by
+        earlier segments and written only after its logits are computed.
+        """
+        history_input_ids = model_inputs["autocompressor_history_input_ids"]
+        history_attention_mask = model_inputs["autocompressor_history_attention_mask"]
+        history_session_ids = model_inputs.get("autocompressor_history_session_ids")
+        history_segment_ids = model_inputs.get("autocompressor_segment_ids")
+        boundary_id = int(model_inputs["autocompressor_boundary_token_id"].item())
+        if history_input_ids.size(0) != 1:
+            raise ValueError(
+                "AutoCompressor episode modes currently require per-device batch size 1"
+            )
+
+        started_at = time.perf_counter()
+        self._reset_online_state(model)
+        set_delta_mem_read_context_mask(model, None)
+        set_delta_mem_write_enabled(model, True)
+        history_nll = None
+        history_tokens = 0
+        segment_count = 0
+        last_outputs = None
+        sequence_length = int(history_attention_mask.sum().item())
+        if history_segment_ids is not None:
+            segment_ids = history_segment_ids[0, :sequence_length].tolist()
+            history_slices = build_autocompressor_session_slices(
+                [int(segment_id) for segment_id in segment_ids]
+            )
+            segment_length = 0
+        elif history_session_ids is None:
+            segment_length = int(model_inputs["autocompressor_segment_length"].item())
+            if segment_length <= 0:
+                raise ValueError("autocompressor segment length must be positive")
+            history_slices = build_autocompressor_segment_slices(
+                sequence_length,
+                segment_length,
+            )
+        else:
+            session_ids = history_session_ids[0, :sequence_length].tolist()
+            history_slices = build_autocompressor_session_slices(
+                [int(session_id) for session_id in session_ids]
+            )
+            segment_length = 0
+        activation_context = (
+            torch.autograd.graph.saved_tensors_hooks(
+                self._pack_autocompressor_activation,
+                self._unpack_autocompressor_activation,
+            )
+            if self.autocompressor_offload_activations
+            else contextlib.nullcontext()
+        )
+        with activation_context:
+            for start, end in history_slices:
+                raw_ids = history_input_ids[:, start:end]
+                raw_mask = history_attention_mask[:, start:end].bool()
+                if not raw_mask.any():
+                    continue
+                boundary = raw_ids.new_full((1, 1), boundary_id)
+                segment_ids = torch.cat((boundary, raw_ids), dim=1)
+                segment_attention = torch.cat(
+                    (
+                        torch.ones(
+                            (1, 1),
+                            dtype=history_attention_mask.dtype,
+                            device=history_attention_mask.device,
+                        ),
+                        raw_mask.to(dtype=history_attention_mask.dtype),
+                    ),
+                    dim=1,
+                )
+                segment_labels = torch.cat(
+                    (
+                        raw_ids.new_full((1, 1), -100),
+                        raw_ids.masked_fill(~raw_mask, -100),
+                    ),
+                    dim=1,
+                )
+                write_ids = raw_ids.new_full(segment_ids.shape, -1)
+                write_ids[:, 1:] = torch.where(
+                    raw_mask,
+                    torch.zeros_like(raw_mask, dtype=write_ids.dtype),
+                    torch.full_like(raw_mask, -1, dtype=write_ids.dtype),
+                )
+                set_delta_mem_write_message_ids(model, write_ids)
+                set_delta_mem_write_sentence_ids(model, None)
+                try:
+                    outputs = model(
+                        input_ids=segment_ids,
+                        attention_mask=segment_attention,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                finally:
+                    set_delta_mem_write_message_ids(model, None)
+
+                shift_logits = outputs.logits[:, :-1, :].contiguous()
+                shift_labels = segment_labels[:, 1:].contiguous()
+                token_count = int(shift_labels.ne(-100).sum().item())
+                if token_count == 0:
+                    continue
+                segment_nll = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                history_nll = (
+                    segment_nll if history_nll is None else history_nll + segment_nll
+                )
+                history_tokens += token_count
+                segment_count += 1
+                last_outputs = outputs
+
+            read_inputs = {
+                "input_ids": model_inputs["input_ids"],
+                "attention_mask": model_inputs["attention_mask"],
+                "labels": model_inputs["labels"],
+            }
+            set_delta_mem_read_context_mask(
+                model, self._build_read_context_mask(read_inputs)
+            )
+            set_delta_mem_write_enabled(model, False)
+            qa_outputs = model(**read_inputs, use_cache=False, return_dict=True)
+
+        qa_loss = qa_outputs.loss
+        if qa_loss is None:
+            raise RuntimeError("autocompressor_episode model forward did not return loss")
+        if qa_loss.ndim > 0:
+            qa_loss = qa_loss.mean()
+        compression_loss = (
+            qa_loss.new_zeros(())
+            if history_nll is None
+            else history_nll / max(history_tokens, 1)
+        )
+        loss = qa_loss + self.autocompressor_loss_weight * compression_loss
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite autocompressor episode loss: {float(loss.detach().float().item())}"
+            )
+        elapsed = time.perf_counter() - started_at
+        self._last_autocompressor_ce = float(compression_loss.detach().float().item())
+        self._last_autocompressor_sft_ce = float(qa_loss.detach().float().item())
+        self._last_autocompressor_tokens = float(history_tokens)
+        self._last_autocompressor_segments = float(segment_count)
+        self._last_autocompressor_segment_length = float(segment_length)
+        self._last_autocompressor_seconds = float(elapsed)
+        self._last_autocompressor_message_count = 0.0
+        self._last_autocompressor_message_tokens = float(history_tokens)
+        state_stats = collect_delta_mem_state_stats(model)
+        self._last_autocompressor_state_norm = float(state_stats["mean_state_norm"])
+        self._last_memory_keep_loss = self._last_autocompressor_sft_ce
+        self._last_memory_full_ce_loss = self._last_autocompressor_sft_ce
+        self._last_memory_wmem = 1.0
+        set_delta_mem_read_context_mask(model, None)
+        set_delta_mem_write_message_ids(model, None)
+        set_delta_mem_write_sentence_ids(model, None)
+        set_delta_mem_write_enabled(model, True)
+        return loss, {
+            "loss": loss.detach(),
+            "logits": qa_outputs.logits if qa_outputs is not None else last_outputs.logits,
+        }
+
+    def _compute_autocompressor_message_ce_loss(
+        self,
+        model,
+        model_inputs: dict[str, torch.Tensor],
+    ):
+        """Run one complete episode sequentially, writing once per message.
+
+        The system prefix is a read-only conditioning prompt.  Each message is
+        evaluated with the state produced by earlier messages, then its hidden
+        states are averaged into exactly one SSW write.  State is deliberately
+        kept attached between message forwards so later-message CE supervises
+        earlier writes.
+        """
+        message_input_ids = model_inputs["autocompressor_message_input_ids"]
+        message_attention_mask = model_inputs["autocompressor_message_attention_mask"]
+        message_labels = model_inputs["autocompressor_message_labels"]
+        system_input_ids = model_inputs["autocompressor_system_input_ids"]
+        system_attention_mask = model_inputs["autocompressor_system_attention_mask"]
+        message_count = int(model_inputs["autocompressor_message_count"].item())
+        boundary_id = int(model_inputs["autocompressor_boundary_token_id"].item())
+        if message_input_ids.size(0) != 1:
+            raise ValueError(
+                "autocompressor_message_ce currently requires per-device batch size 1"
+            )
+        if message_count <= 0:
+            raise ValueError("autocompressor_message_ce received no non-system messages")
+
+        started_at = time.perf_counter()
+        self._reset_online_state(model)
+        set_delta_mem_read_context_mask(model, None)
+        set_delta_mem_write_enabled(model, True)
+        total_nll = None
+        total_tokens = 0
+        total_message_tokens = 0
+        last_outputs = None
+        activation_context = (
+            torch.autograd.graph.saved_tensors_hooks(
+                self._pack_autocompressor_activation,
+                self._unpack_autocompressor_activation,
+            )
+            if self.autocompressor_offload_activations
+            else contextlib.nullcontext()
+        )
+        with activation_context:
+            for message_index in range(message_count):
+                raw_ids = message_input_ids[:, message_index, :]
+                raw_mask = message_attention_mask[:, message_index, :].bool()
+                raw_labels = message_labels[:, message_index, :].masked_fill(~raw_mask, -100)
+                if not raw_mask.any():
+                    continue
+
+                system_ids = system_input_ids
+                system_mask = system_attention_mask.bool()
+                boundary = raw_ids.new_full((1, 1), boundary_id)
+                segment_ids = torch.cat((system_ids, boundary, raw_ids), dim=1)
+                segment_attention = torch.cat(
+                    (
+                        system_mask.to(dtype=message_attention_mask.dtype),
+                        torch.ones((1, 1), dtype=message_attention_mask.dtype, device=message_attention_mask.device),
+                        raw_mask.to(dtype=message_attention_mask.dtype),
+                    ),
+                    dim=1,
+                )
+                segment_labels = torch.cat(
+                    (
+                        raw_labels.new_full(system_ids.shape, -100),
+                        raw_labels.new_full((1, 1), -100),
+                        raw_labels,
+                    ),
+                    dim=1,
+                )
+                # H100 SDPA backward requires the sequence stride to be
+                # aligned to four elements.  These extra positions are fully
+                # masked and therefore do not change either CE or the write.
+                alignment_padding = (-segment_ids.size(1)) % 4
+                if alignment_padding:
+                    pad_shape = (1, alignment_padding)
+                    segment_ids = torch.cat(
+                        (segment_ids, raw_ids.new_zeros(pad_shape)), dim=1
+                    )
+                    segment_attention = torch.cat(
+                        (
+                            segment_attention,
+                            message_attention_mask.new_zeros(pad_shape),
+                        ),
+                        dim=1,
+                    )
+                    segment_labels = torch.cat(
+                        (
+                            segment_labels,
+                            raw_labels.new_full(pad_shape, -100),
+                        ),
+                        dim=1,
+                    )
+                # System prefix and synthetic boundary are read-only.  The complete
+                # raw message (including chat-template wrapper tokens) is one SSW
+                # proposal and padding never enters its mean.
+                write_ids = raw_ids.new_full(segment_ids.shape, -1)
+                raw_start = system_ids.size(1) + 1
+                raw_end = raw_start + raw_ids.size(1)
+                write_ids[:, raw_start:raw_end] = torch.where(
+                    raw_mask,
+                    torch.zeros_like(raw_mask, dtype=write_ids.dtype),
+                    torch.full_like(raw_mask, -1, dtype=write_ids.dtype),
+                )
+                set_delta_mem_write_message_ids(model, write_ids)
+                set_delta_mem_write_sentence_ids(model, None)
+                try:
+                    outputs = model(
+                        input_ids=segment_ids,
+                        attention_mask=segment_attention,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                finally:
+                    set_delta_mem_write_message_ids(model, None)
+
+                shift_logits = outputs.logits[:, :-1, :].contiguous()
+                shift_labels = segment_labels[:, 1:].contiguous()
+                valid_labels = shift_labels.ne(-100)
+                token_count = int(valid_labels.sum().item())
+                if token_count == 0:
+                    continue
+                message_nll = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                total_nll = message_nll if total_nll is None else total_nll + message_nll
+                total_tokens += token_count
+                total_message_tokens += int(raw_mask.sum().item())
+                last_outputs = outputs
+                for _, module in iter_delta_mem_modules(model):
+                    if module.delta_state is not None and not torch.isfinite(module.delta_state).all():
+                        raise FloatingPointError(
+                            f"Non-finite AutoCompressor message state after message {message_index}"
+                        )
+
+        if total_nll is None or total_tokens == 0:
+            raise ValueError("autocompressor_message_ce received an empty training episode")
+        loss = total_nll / total_tokens
+        elapsed = time.perf_counter() - started_at
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite AutoCompressor message loss: {float(loss.detach().float().item())}"
+            )
+        self._last_autocompressor_ce = float(loss.detach().float().item())
+        self._last_autocompressor_tokens = float(total_tokens)
+        self._last_autocompressor_segments = float(message_count)
+        self._last_autocompressor_segment_length = 0.0
+        self._last_autocompressor_seconds = float(elapsed)
+        self._last_autocompressor_message_count = float(message_count)
+        self._last_autocompressor_message_tokens = float(total_message_tokens)
+        state_stats = collect_delta_mem_state_stats(model)
+        self._last_autocompressor_state_norm = float(state_stats["mean_state_norm"])
+        self._last_memory_keep_loss = self._last_autocompressor_ce
+        self._last_memory_full_ce_loss = self._last_autocompressor_ce
+        self._last_memory_wmem = 1.0
+        set_delta_mem_read_context_mask(model, None)
+        set_delta_mem_write_message_ids(model, None)
+        set_delta_mem_write_sentence_ids(model, None)
+        set_delta_mem_write_enabled(model, True)
+        return loss, {
+            "loss": loss.detach(),
+            "logits": last_outputs.logits if last_outputs is not None else None,
+        }
+
+    @staticmethod
+    def _pack_autocompressor_activation(tensor: torch.Tensor):
+        # Keep the full cross-message graph, but move only large, contiguous
+        # 3-D floating activations off the GPU.  Attention masks/biases and
+        # layout-sensitive tensors stay on the GPU, avoiding SDPA/FlashAttention
+        # stride constraints after a CPU round trip.
+        should_offload = (
+            tensor.is_cuda
+            and tensor.is_floating_point()
+            and tensor.ndim == 3
+            and tensor.numel() >= (1 << 16)
+        )
+        if not should_offload:
+            return tensor, None
+        return tensor.detach().to(device="cpu"), tensor.device
+
+    @staticmethod
+    def _unpack_autocompressor_activation(packed):
+        cpu_tensor, device = packed
+        if device is None:
+            return cpu_tensor
+        return cpu_tensor.to(device=device, non_blocking=True).contiguous()
 
     def _build_read_context_mask(self, model_inputs: dict[str, torch.Tensor]) -> torch.Tensor | None:
         labels = model_inputs.get("labels")
@@ -1139,6 +1758,18 @@ class DeltaMemTrainer(Trainer):
         if self.model_accepts_loss_kwargs and num_items_in_batch is not None:
             loss_kwargs["num_items_in_batch"] = num_items_in_batch
 
+        if "autocompressor_input_ids" in inputs:
+            loss, outputs = self._compute_autocompressor_ssw_loss(model, inputs)
+            return (loss, outputs) if return_outputs else loss
+
+        if "autocompressor_history_input_ids" in inputs:
+            loss, outputs = self._compute_autocompressor_episode_loss(model, inputs)
+            return (loss, outputs) if return_outputs else loss
+
+        if "autocompressor_message_input_ids" in inputs:
+            loss, outputs = self._compute_autocompressor_message_ce_loss(model, inputs)
+            return (loss, outputs) if return_outputs else loss
+
         model_inputs = dict(inputs)
         write_input_ids = model_inputs.pop("write_input_ids", None)
         write_attention_mask = model_inputs.pop("write_attention_mask", None)
@@ -1418,6 +2049,21 @@ class DeltaMemTrainer(Trainer):
                     "delta/memory_partition_balance_loss": self._last_memory_partition_balance_loss,
                 }
             )
+        if self._last_autocompressor_segments > 0.0:
+            enriched_logs.update(
+                {
+                    "autocompressor/ce": self._last_autocompressor_ce,
+                    "autocompressor/sft_ce": self._last_autocompressor_sft_ce,
+                    "autocompressor/loss_weight": self.autocompressor_loss_weight,
+                    "autocompressor/tokens": self._last_autocompressor_tokens,
+                    "autocompressor/segments": self._last_autocompressor_segments,
+                    "autocompressor/segment_length": self._last_autocompressor_segment_length,
+                    "autocompressor/seconds": self._last_autocompressor_seconds,
+                    "autocompressor/state_norm": self._last_autocompressor_state_norm,
+                    "autocompressor/message_count": self._last_autocompressor_message_count,
+                    "autocompressor/message_tokens": self._last_autocompressor_message_tokens,
+                }
+            )
         super().log(enriched_logs, start_time=start_time)
 
     def training_step(
@@ -1462,6 +2108,12 @@ def parse_args() -> argparse.Namespace:
     default_optim = "adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch"
     parser = argparse.ArgumentParser(description="Train Delta-Mem on a Hugging Face causal LM.")
     parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--init-adapter-dir",
+        type=Path,
+        default=None,
+        help="Existing Delta-Mem adapter directory to warm-start before training.",
+    )
     parser.add_argument("--train-file", type=Path, default=None)
     parser.add_argument("--dataset-name", default=None)
     parser.add_argument("--dataset-split", default="train")
@@ -1554,19 +2206,62 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-write-granularity",
         default="token",
-        choices=["token", "message_mean", "sentence_mean"],
+        choices=["token", "message_mean", "sentence_mean", "embedding_semantic"],
     )
+    parser.add_argument(
+        "--semantic-model-path",
+        default=None,
+        help="Local Sentence-BERT/MiniLM path used by embedding_semantic preprocessing.",
+    )
+    parser.add_argument("--semantic-percentile", type=float, default=65.0)
+    parser.add_argument("--semantic-max-chunk-tokens", type=int, default=512)
+    parser.add_argument("--semantic-selection-budget", type=int, default=8192)
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument(
         "--training-mode",
         default="episode",
-        choices=["dialogue", "episode"],
+        choices=[
+            "dialogue",
+            "episode",
+            "autocompressor_ssw",
+            "autocompressor_episode",
+            "autocompressor_session_episode",
+            "autocompressor_surprisal_episode",
+            "autocompressor_message_ce",
+        ],
+    )
+    parser.add_argument(
+        "--autocompressor-segment-length",
+        type=int,
+        default=500,
+        help="Fixed token count per AutoCompressor-SSW segment.",
+    )
+    parser.add_argument(
+        "--autocompressor-max-length",
+        type=int,
+        default=6000,
+        help="Maximum complete-document token count for AutoCompressor-SSW.",
+    )
+    parser.add_argument(
+        "--autocompressor-loss-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight applied to history segment causal CE in the fixed-token and "
+            "session-level AutoCompressor episode modes."
+        ),
     )
     parser.add_argument(
         "--episode-recent-messages",
         type=int,
         default=4,
         help="Number of trailing non-system messages to keep visible during episode training.",
+    )
+    parser.add_argument(
+        "--autocompressor-surprisal-threshold",
+        type=float,
+        default=None,
+        help="Threshold recorded in the precomputed surprisal dataset.",
     )
     parser.add_argument(
         "--max-write-length",
@@ -1600,6 +2295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataloader-num-workers", type=int, default=4)
     parser.add_argument("--group-by-length", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--autocompressor-offload-activations",
+        action="store_true",
+        help="Offload autograd-saved tensors to CPU for full-episode AutoCompressor CE.",
+    )
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--tf32", action="store_true")
     parser.add_argument("--deepspeed-config", type=Path, default=None)
@@ -1860,6 +2560,43 @@ def _tokenize_chat_messages_with_message_ids(
     return input_ids, message_ids
 
 
+def _session_ids_for_tokenized_messages(
+    messages: list[dict[str, str]],
+    message_ids: list[int],
+) -> list[int]:
+    """Map non-system message spans to contiguous, explicit session ids."""
+    session_by_message_id: dict[int, int] = {}
+    previous_session_label: object | None = None
+    seen_session_labels: list[object] = []
+    current_session_id = -1
+    next_message_id = 0
+    for message in messages:
+        if message["role"] == "system":
+            continue
+        if "session_id" not in message:
+            raise ValueError(
+                "autocompressor_session_episode requires every non-system "
+                "history message to provide a session_id"
+            )
+        session_label = message["session_id"]
+        if session_label is None:
+            raise ValueError(
+                "autocompressor_session_episode session_id values must not be null"
+            )
+        if session_label != previous_session_label:
+            if any(session_label == seen_label for seen_label in seen_session_labels):
+                raise ValueError(
+                    "session_id values must form contiguous history spans; "
+                    f"session_id={session_label!r} reappeared after a later session"
+                )
+            seen_session_labels.append(session_label)
+            current_session_id += 1
+            previous_session_label = session_label
+        session_by_message_id[next_message_id] = current_session_id
+        next_message_id += 1
+    return [session_by_message_id.get(message_id, -1) for message_id in message_ids]
+
+
 def _truncate_sft_sequence(
     input_ids: list[int],
     labels: list[int],
@@ -1949,6 +2686,9 @@ def build_episode_training_examples(
     episode_recent_messages: int,
     max_write_length: int,
     include_sentence_ids: bool,
+    include_embedding_semantic_ids: bool = False,
+    autocompressor_segment_length: int = 0,
+    include_session_ids: bool = False,
 ) -> list[dict]:
     if episode_recent_messages < 0:
         raise ValueError("episode_recent_messages must be >= 0")
@@ -1966,16 +2706,62 @@ def build_episode_training_examples(
             visible_non_system = non_system_prefix[-episode_recent_messages:]
             write_non_system = non_system_prefix[:-episode_recent_messages]
 
+        if include_session_ids:
+            for message in non_system_prefix:
+                if "session_id" not in message or message["session_id"] is None:
+                    raise ValueError(
+                        "autocompressor_session_episode requires every prior non-system "
+                        "message to provide a non-null session_id"
+                    )
+            write_session_labels = [
+                message["session_id"] for message in write_non_system
+            ]
+            visible_session_labels = [
+                message["session_id"] for message in visible_non_system
+            ]
+            overlap = [
+                session_id
+                for session_id in write_session_labels
+                if any(session_id == visible_id for visible_id in visible_session_labels)
+            ]
+            if overlap:
+                raise ValueError(
+                    "autocompressor_session_episode cannot split one session between "
+                    f"memory history and visible prompt: {overlap!r}"
+                )
+
         write_messages = system_prefix + write_non_system if write_non_system else []
         write_input_ids: list[int] = []
         write_message_ids: list[int] = []
         write_sentence_ids: list[int] = []
+        write_session_ids: list[int] = []
         if write_messages:
             full_write_input_ids, write_message_ids, write_sentence_ids = _tokenize_chat_messages_with_write_span_ids(
                 tokenizer,
                 write_messages,
                 include_sentence_ids=include_sentence_ids,
             )
+            if include_session_ids:
+                full_write_session_ids = _session_ids_for_tokenized_messages(
+                    write_messages,
+                    write_message_ids,
+                )
+            if include_embedding_semantic_ids:
+                question = next(
+                    (
+                        messages[index]["content"]
+                        for index in range(target_index - 1, -1, -1)
+                        if messages[index]["role"] == "user"
+                    ),
+                    None,
+                )
+                write_sentence_ids = _semantic_ids_for_tokenized_messages(
+                    tokenizer,
+                    write_messages,
+                    full_write_input_ids,
+                    write_sentence_ids,
+                    question=question,
+                )
             write_input_ids, write_message_ids = _truncate_sft_sequence(
                 full_write_input_ids,
                 write_message_ids,
@@ -1986,6 +2772,12 @@ def build_episode_training_examples(
                 write_sentence_ids,
                 max_write_length,
             )
+            if include_session_ids:
+                _, write_session_ids = _truncate_sft_sequence(
+                    full_write_input_ids,
+                    full_write_session_ids,
+                    max_write_length,
+                )
 
         read_messages = system_prefix + visible_non_system + [dict(messages[target_index])]
         read_features = tokenize_messages_for_sft(
@@ -2014,6 +2806,22 @@ def build_episode_training_examples(
                 state_only_write_messages,
                 include_sentence_ids=include_sentence_ids,
             )
+            if include_embedding_semantic_ids:
+                question = next(
+                    (
+                        messages[index]["content"]
+                        for index in range(target_index - 1, -1, -1)
+                        if messages[index]["role"] == "user"
+                    ),
+                    None,
+                )
+                state_only_write_sentence_ids = _semantic_ids_for_tokenized_messages(
+                    tokenizer,
+                    state_only_write_messages,
+                    full_state_only_write_input_ids,
+                    state_only_write_sentence_ids,
+                    question=question,
+                )
             state_only_write_input_ids, state_only_write_message_ids = _truncate_sft_sequence(
                 full_state_only_write_input_ids,
                 state_only_write_message_ids,
@@ -2034,8 +2842,7 @@ def build_episode_training_examples(
             assistant_loss_mode="final_assistant_only",
         )
 
-        episodes.append(
-            {
+        episode = {
                 "write_input_ids": write_input_ids,
                 "write_attention_mask": [1] * len(write_input_ids),
                 "write_message_ids": write_message_ids,
@@ -2054,7 +2861,9 @@ def build_episode_training_examples(
                 "write_message_count": len(write_messages),
                 "visible_message_count": len(read_messages) - 1,
             }
-        )
+        if include_session_ids:
+            episode["write_session_ids"] = write_session_ids
+        episodes.append(episode)
     return episodes
 
 
@@ -2069,7 +2878,11 @@ def tokenize_example(
     max_write_length: int,
 ) -> dict:
     normalized = normalize_example(example)
-    if training_mode == "episode":
+    if training_mode in {
+        "episode",
+        "autocompressor_episode",
+        "autocompressor_session_episode",
+    }:
         raise ValueError("tokenize_example does not support episode mode; use tokenize_examples_batch")
     if training_mode != "dialogue":
         raise ValueError(f"Unsupported training_mode: {training_mode}")
@@ -2079,6 +2892,160 @@ def tokenize_example(
         max_length,
         assistant_loss_mode=assistant_loss_mode,
     )
+
+
+def tokenize_autocompressor_example(
+    tokenizer,
+    example: dict,
+    max_length: int,
+    *,
+    segment_length: int,
+) -> dict:
+    """Tokenize one complete document for sequential AutoCompressor-SSW CE."""
+    if max_length <= 0:
+        raise ValueError("autocompressor max_length must be > 0")
+    if segment_length <= 0:
+        raise ValueError("autocompressor segment_length must be > 0")
+    normalized = normalize_example(example)
+    input_ids = _tokenize_chat_messages(tokenizer, normalized.messages)
+    input_ids = input_ids[:max_length]
+    if not input_ids:
+        raise ValueError("AutoCompressor-SSW cannot train on an empty tokenized example")
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": input_ids.copy(),
+        "autocompressor_segment_length": segment_length,
+        "autocompressor_boundary_token_id": resolve_autocompressor_boundary_token_id(tokenizer),
+    }
+
+
+def tokenize_autocompressor_message_example(
+    tokenizer,
+    example: dict,
+    max_length: int,
+) -> dict:
+    """Tokenize one complete episode into ordered message-level write spans."""
+    if max_length <= 0:
+        raise ValueError("autocompressor max_length must be > 0")
+    normalized = normalize_example(example)
+    full_input_ids, full_message_ids, _ = _tokenize_chat_messages_with_write_span_ids(
+        tokenizer,
+        normalized.messages,
+        include_sentence_ids=False,
+    )
+    input_ids = full_input_ids[:max_length]
+    message_ids = full_message_ids[:max_length]
+    first_message_position = next(
+        (index for index, message_id in enumerate(message_ids) if message_id >= 0),
+        None,
+    )
+    if first_message_position is None:
+        raise ValueError("autocompressor_message_ce episode has no non-system message")
+
+    system_input_ids = input_ids[:first_message_position]
+    message_input_ids: list[list[int]] = []
+    for message_id in sorted({value for value in message_ids if value >= 0}):
+        span = [
+            token_id
+            for token_id, span_id in zip(input_ids, message_ids)
+            if span_id == message_id
+        ]
+        if span:
+            message_input_ids.append(span)
+    if not message_input_ids:
+        raise ValueError("autocompressor_message_ce episode has empty message spans")
+    return {
+        "autocompressor_message_input_ids": message_input_ids,
+        "autocompressor_message_attention_mask": [
+            [1] * len(span) for span in message_input_ids
+        ],
+        "autocompressor_message_labels": [list(span) for span in message_input_ids],
+        "autocompressor_system_input_ids": system_input_ids,
+        "autocompressor_system_attention_mask": [1] * len(system_input_ids),
+        "autocompressor_message_count": len(message_input_ids),
+        "autocompressor_boundary_token_id": resolve_autocompressor_boundary_token_id(tokenizer),
+    }
+
+
+def resolve_autocompressor_boundary_token_id(tokenizer) -> int:
+    """Resolve a stable segment marker from tokenizer metadata."""
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        value = getattr(tokenizer, name, None)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if value is not None:
+            return int(value)
+    raise ValueError("AutoCompressor-SSW requires tokenizer bos/eos/pad token id")
+
+
+def build_autocompressor_segment_slices(
+    sequence_length: int,
+    segment_length: int,
+) -> list[tuple[int, int]]:
+    if sequence_length < 0:
+        raise ValueError("sequence_length must be >= 0")
+    if segment_length <= 0:
+        raise ValueError("segment_length must be > 0")
+    return [
+        (start, min(start + segment_length, sequence_length))
+        for start in range(0, sequence_length, segment_length)
+    ]
+
+
+def build_autocompressor_session_slices(
+    session_ids: list[int],
+) -> list[tuple[int, int]]:
+    """Return contiguous token spans, one for each explicit session id."""
+    if not session_ids:
+        return []
+    if any(session_id < 0 for session_id in session_ids):
+        raise ValueError("session-level AutoCompressor history contains an invalid session id")
+    slices: list[tuple[int, int]] = []
+    start = 0
+    seen_session_ids: set[int] = set()
+    current_session_id = session_ids[0]
+    for index, session_id in enumerate(session_ids[1:], start=1):
+        if session_id == current_session_id:
+            continue
+        if current_session_id in seen_session_ids:
+            raise ValueError("a session id reappeared after a later session")
+        seen_session_ids.add(current_session_id)
+        slices.append((start, index))
+        start = index
+        current_session_id = session_id
+    if current_session_id in seen_session_ids:
+        raise ValueError("a session id reappeared after a later session")
+    slices.append((start, len(session_ids)))
+    return slices
+
+
+def build_autocompressor_surprisal_segment_ids(
+    token_surprisal: list[float],
+    threshold: float,
+    *,
+    min_chunk_tokens: int = 1,
+    max_chunk_tokens: int = 512,
+) -> list[int]:
+    """Return continuous surprisal segments; message boundaries are ignored."""
+    if threshold <= 0 or min_chunk_tokens <= 0 or max_chunk_tokens < min_chunk_tokens:
+        raise ValueError("invalid surprisal segmentation limits")
+    segment_ids: list[int] = []
+    segment_id, segment_tokens = 0, 0
+    total = 0.0
+    for score in token_surprisal:
+        value = float(score)
+        if not math.isfinite(value) or value < 0:
+            value = 0.0
+        segment_ids.append(segment_id)
+        total += value
+        segment_tokens += 1
+        if segment_tokens >= max_chunk_tokens or (
+            segment_tokens >= min_chunk_tokens and total >= threshold
+        ):
+            segment_id += 1
+            total, segment_tokens = 0.0, 0
+    return segment_ids
 
 
 def add_length_column(example: dict) -> dict[str, int]:
@@ -2098,13 +3065,19 @@ def tokenize_examples_batch(
     episode_recent_messages: int,
     max_write_length: int,
     include_sentence_ids: bool,
+    include_embedding_semantic_ids: bool = False,
+    autocompressor_segment_length: int = 0,
 ) -> dict[str, list]:
     tokenized: dict[str, list] = {
         "input_ids": [],
         "attention_mask": [],
         "labels": [],
     }
-    if training_mode == "episode":
+    if training_mode in {
+        "episode",
+        "autocompressor_episode",
+        "autocompressor_session_episode",
+    }:
         tokenized["write_input_ids"] = []
         tokenized["write_attention_mask"] = []
         tokenized["write_message_ids"] = []
@@ -2119,6 +3092,18 @@ def tokenize_examples_batch(
         tokenized["episode_target_message_index"] = []
         tokenized["write_message_count"] = []
         tokenized["visible_message_count"] = []
+        if training_mode in {
+            "autocompressor_episode",
+            "autocompressor_session_episode",
+        }:
+            tokenized["autocompressor_history_input_ids"] = []
+            tokenized["autocompressor_history_attention_mask"] = []
+            tokenized["autocompressor_boundary_token_id"] = []
+        if training_mode == "autocompressor_episode":
+            tokenized["autocompressor_segment_length"] = []
+        if training_mode == "autocompressor_session_episode":
+            tokenized["write_session_ids"] = []
+            tokenized["autocompressor_history_session_ids"] = []
 
     batch_size = len(next(iter(batch.values())))
     for row_index in range(batch_size):
@@ -2134,7 +3119,11 @@ def tokenize_examples_batch(
             for key, value in features.items():
                 tokenized[key].append(value)
             continue
-        if training_mode != "episode":
+        if training_mode not in {
+            "episode",
+            "autocompressor_episode",
+            "autocompressor_session_episode",
+        }:
             raise ValueError(f"Unsupported training_mode: {training_mode}")
         for episode in build_episode_training_examples(
             tokenizer,
@@ -2144,7 +3133,43 @@ def tokenize_examples_batch(
             episode_recent_messages=episode_recent_messages,
             max_write_length=max_write_length,
             include_sentence_ids=include_sentence_ids,
+            include_embedding_semantic_ids=include_embedding_semantic_ids,
+            include_session_ids=training_mode == "autocompressor_session_episode",
         ):
+            if training_mode == "autocompressor_episode":
+                episode["autocompressor_history_input_ids"] = list(
+                    episode["write_input_ids"]
+                )
+                episode["autocompressor_history_attention_mask"] = list(
+                    episode["write_attention_mask"]
+                )
+                if autocompressor_segment_length <= 0:
+                    raise ValueError("autocompressor segment length must be positive")
+                episode["autocompressor_segment_length"] = autocompressor_segment_length
+                episode["autocompressor_boundary_token_id"] = (
+                    resolve_autocompressor_boundary_token_id(tokenizer)
+                )
+            if training_mode == "autocompressor_session_episode":
+                history_pairs = [
+                    (token_id, session_id)
+                    for token_id, session_id in zip(
+                        episode["write_input_ids"],
+                        episode["write_session_ids"],
+                    )
+                    if session_id >= 0
+                ]
+                episode["autocompressor_history_input_ids"] = [
+                    token_id for token_id, _ in history_pairs
+                ]
+                episode["autocompressor_history_attention_mask"] = [
+                    1
+                ] * len(history_pairs)
+                episode["autocompressor_history_session_ids"] = [
+                    session_id for _, session_id in history_pairs
+                ]
+                episode["autocompressor_boundary_token_id"] = (
+                    resolve_autocompressor_boundary_token_id(tokenizer)
+                )
             for key, value in episode.items():
                 tokenized[key].append(value)
     return tokenized
@@ -2159,6 +3184,12 @@ def _tokenized_dataset_cache_key(
     for fn in (
         normalize_example,
         tokenize_messages_for_sft,
+        tokenize_autocompressor_example,
+        tokenize_autocompressor_message_example,
+        resolve_autocompressor_boundary_token_id,
+        build_autocompressor_segment_slices,
+        build_autocompressor_session_slices,
+        _session_ids_for_tokenized_messages,
         _sentence_ids_for_message_delta,
         _tokenize_chat_messages_with_write_span_ids,
         build_episode_training_examples,
@@ -2167,7 +3198,7 @@ def _tokenized_dataset_cache_key(
         split_text_into_sentence_token_chunks,
     ):
         code_hash.update(inspect.getsource(fn).encode("utf-8"))
-    include_sentence_ids = args.memory_write_granularity == "sentence_mean"
+    include_sentence_ids = args.memory_write_granularity in {"sentence_mean", "embedding_semantic"}
     payload = {
         "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
         "dataset_name": args.dataset_name,
@@ -2176,12 +3207,19 @@ def _tokenized_dataset_cache_key(
         "tokenizer_name_or_path": getattr(tokenizer, "name_or_path", ""),
         "tokenizer_class": tokenizer.__class__.__name__,
         "max_length": args.max_length,
+        "autocompressor_max_length": args.autocompressor_max_length,
+        "autocompressor_system_prefix_policy": "repeat_masked",
         "training_mode": args.training_mode,
         "assistant_loss_mode": args.assistant_loss_mode,
         "episode_recent_messages": args.episode_recent_messages,
         "max_write_length": args.max_write_length,
+        "autocompressor_segment_length": args.autocompressor_segment_length,
         "memory_write_granularity": args.memory_write_granularity,
         "include_sentence_ids": include_sentence_ids,
+        "semantic_model_path": args.semantic_model_path,
+        "semantic_percentile": args.semantic_percentile,
+        "semantic_max_chunk_tokens": args.semantic_max_chunk_tokens,
+        "semantic_selection_budget": args.semantic_selection_budget,
         "group_by_length": args.group_by_length,
         "code_hash": code_hash.hexdigest(),
     }
@@ -2194,7 +3232,28 @@ def _build_tokenized_dataset(
     dataset: Dataset,
     tokenizer,
 ) -> Dataset:
-    if args.training_mode == "dialogue":
+    if args.training_mode == "autocompressor_ssw":
+        tokenized = dataset.map(
+            lambda example: tokenize_autocompressor_example(
+                tokenizer,
+                example,
+                args.autocompressor_max_length,
+                segment_length=args.autocompressor_segment_length,
+            ),
+            remove_columns=dataset.column_names,
+            num_proc=None if args.dataset_num_proc <= 1 else args.dataset_num_proc,
+        )
+    elif args.training_mode == "autocompressor_message_ce":
+        tokenized = dataset.map(
+            lambda example: tokenize_autocompressor_message_example(
+                tokenizer,
+                example,
+                args.autocompressor_max_length,
+            ),
+            remove_columns=dataset.column_names,
+            num_proc=None if args.dataset_num_proc <= 1 else args.dataset_num_proc,
+        )
+    elif args.training_mode == "dialogue":
         tokenized = dataset.map(
             lambda example: tokenize_example(
                 tokenizer,
@@ -2208,7 +3267,12 @@ def _build_tokenized_dataset(
             remove_columns=dataset.column_names,
             num_proc=None if args.dataset_num_proc <= 1 else args.dataset_num_proc,
         )
-    elif args.training_mode == "episode":
+    elif args.training_mode in {
+        "episode",
+        "autocompressor_episode",
+        "autocompressor_session_episode",
+        "autocompressor_surprisal_episode",
+    }:
         tokenized = dataset.map(
             lambda batch: tokenize_examples_batch(
                 tokenizer,
@@ -2218,11 +3282,15 @@ def _build_tokenized_dataset(
                 training_mode=args.training_mode,
                 episode_recent_messages=args.episode_recent_messages,
                 max_write_length=args.max_write_length,
-                include_sentence_ids=args.memory_write_granularity == "sentence_mean",
+                include_sentence_ids=args.memory_write_granularity in {"sentence_mean", "embedding_semantic"},
+                include_embedding_semantic_ids=args.memory_write_granularity == "embedding_semantic",
+                autocompressor_segment_length=args.autocompressor_segment_length,
             ),
             batched=True,
             remove_columns=dataset.column_names,
-            num_proc=None if args.dataset_num_proc <= 1 else args.dataset_num_proc,
+            num_proc=(1 if args.memory_write_granularity == "embedding_semantic" else (
+                None if args.dataset_num_proc <= 1 else args.dataset_num_proc
+            )),
         )
     else:
         raise ValueError(f"Unsupported training_mode: {args.training_mode}")
@@ -2286,8 +3354,15 @@ def prepare_tokenized_dataset(
                         "assistant_loss_mode": args.assistant_loss_mode,
                         "episode_recent_messages": args.episode_recent_messages,
                         "max_write_length": args.max_write_length,
+                        "autocompressor_segment_length": args.autocompressor_segment_length,
+                        "autocompressor_max_length": args.autocompressor_max_length,
+                        "autocompressor_system_prefix_policy": "repeat_masked",
                         "memory_write_granularity": args.memory_write_granularity,
-                        "include_sentence_ids": args.memory_write_granularity == "sentence_mean",
+                        "include_sentence_ids": args.memory_write_granularity in {"sentence_mean", "embedding_semantic"},
+                        "semantic_model_path": args.semantic_model_path,
+                        "semantic_percentile": args.semantic_percentile,
+                        "semantic_max_chunk_tokens": args.semantic_max_chunk_tokens,
+                        "semantic_selection_budget": args.semantic_selection_budget,
                         "max_length": args.max_length,
                     },
                     indent=2,
@@ -2308,6 +3383,16 @@ def prepare_tokenized_dataset(
 
 
 def detect_training_mode(tokenized: Dataset) -> str:
+    if "autocompressor_segment_ids" in tokenized.column_names:
+        return "autocompressor_surprisal_episode"
+    if "autocompressor_history_session_ids" in tokenized.column_names:
+        return "autocompressor_session_episode"
+    if "autocompressor_history_input_ids" in tokenized.column_names:
+        return "autocompressor_episode"
+    if "autocompressor_message_input_ids" in tokenized.column_names:
+        return "autocompressor_message_ce"
+    if "autocompressor_segment_length" in tokenized.column_names:
+        return "autocompressor_ssw"
     if "write_input_ids" in tokenized.column_names:
         return "episode"
     return "dialogue"
@@ -2366,6 +3451,131 @@ class DialogueCausalLMCollator:
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+
+class AutoCompressorSSWCollator:
+    """Pad complete documents; segmentation happens inside the trainer."""
+
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
+        pad_token_id = self.tokenizer.pad_token_id
+        max_len = max(len(feature["input_ids"]) for feature in features)
+        input_ids = []
+        attention_mask = []
+        for feature in features:
+            pad_len = max_len - len(feature["input_ids"])
+            input_ids.append(feature["input_ids"] + [pad_token_id] * pad_len)
+            attention_mask.append(feature["attention_mask"] + [0] * pad_len)
+        segment_lengths = {
+            int(feature["autocompressor_segment_length"]) for feature in features
+        }
+        boundary_ids = {
+            int(feature["autocompressor_boundary_token_id"]) for feature in features
+        }
+        if len(segment_lengths) != 1:
+            raise ValueError("AutoCompressor-SSW batch contains mixed segment lengths")
+        if len(boundary_ids) != 1:
+            raise ValueError("AutoCompressor-SSW batch contains mixed boundary token ids")
+        return {
+            "autocompressor_input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "autocompressor_attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "autocompressor_segment_length": torch.tensor(
+                next(iter(segment_lengths)), dtype=torch.long
+            ),
+            "autocompressor_boundary_token_id": torch.tensor(
+                next(iter(boundary_ids)), dtype=torch.long
+            ),
+        }
+
+
+class AutoCompressorMessageCECollator:
+    """Pad one complete episode into a batch of ordered message spans."""
+
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
+        if not features:
+            raise ValueError("AutoCompressor message batch is empty")
+        if len(features) != 1:
+            raise ValueError("AutoCompressor message CE requires batch size 1")
+        pad_token_id = self.tokenizer.pad_token_id
+        message_counts = {
+            int(feature["autocompressor_message_count"]) for feature in features
+        }
+        boundary_ids = {
+            int(feature["autocompressor_boundary_token_id"]) for feature in features
+        }
+        if len(message_counts) != 1 or len(boundary_ids) != 1:
+            raise ValueError("AutoCompressor message batch contains mixed metadata")
+        message_count = next(iter(message_counts))
+        max_message_length = max(
+            len(message)
+            for feature in features
+            for message in feature["autocompressor_message_input_ids"]
+        )
+        max_system_length = max(
+            len(feature["autocompressor_system_input_ids"]) for feature in features
+        )
+        message_input_ids = []
+        message_attention_mask = []
+        message_labels = []
+        for feature in features:
+            messages = feature["autocompressor_message_input_ids"]
+            if len(messages) != message_count:
+                raise ValueError("AutoCompressor message count does not match spans")
+            message_input_ids.append(
+                [
+                    message + [pad_token_id] * (max_message_length - len(message))
+                    for message in messages
+                ]
+            )
+            message_attention_mask.append(
+                [
+                    [1] * len(message) + [0] * (max_message_length - len(message))
+                    for message in messages
+                ]
+            )
+            message_labels.append(
+                [
+                    message + [-100] * (max_message_length - len(message))
+                    for message in messages
+                ]
+            )
+        system_input_ids = [
+            feature["autocompressor_system_input_ids"]
+            + [pad_token_id]
+            * (max_system_length - len(feature["autocompressor_system_input_ids"]))
+            for feature in features
+        ]
+        system_attention_mask = [
+            [1] * len(feature["autocompressor_system_input_ids"])
+            + [0] * (max_system_length - len(feature["autocompressor_system_input_ids"]))
+            for feature in features
+        ]
+        return {
+            "autocompressor_message_input_ids": torch.tensor(
+                message_input_ids, dtype=torch.long
+            ),
+            "autocompressor_message_attention_mask": torch.tensor(
+                message_attention_mask, dtype=torch.long
+            ),
+            "autocompressor_message_labels": torch.tensor(
+                message_labels, dtype=torch.long
+            ),
+            "autocompressor_system_input_ids": torch.tensor(
+                system_input_ids, dtype=torch.long
+            ),
+            "autocompressor_system_attention_mask": torch.tensor(
+                system_attention_mask, dtype=torch.long
+            ),
+            "autocompressor_message_count": torch.tensor(message_count, dtype=torch.long),
+            "autocompressor_boundary_token_id": torch.tensor(
+                next(iter(boundary_ids)), dtype=torch.long
+            ),
         }
 
 
@@ -2479,7 +3689,139 @@ class EpisodeCausalLMCollator(DialogueCausalLMCollator):
         return batch
 
 
+class AutoCompressorEpisodeCollator(EpisodeCausalLMCollator):
+    """Add padded history segments to standard episode SFT batches."""
+
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
+        batch = super().__call__(features)
+        if len(features) != 1:
+            raise ValueError("autocompressor_episode requires per-device batch size 1")
+        pad_token_id = self.tokenizer.pad_token_id
+        history_lengths = [len(feature["autocompressor_history_input_ids"]) for feature in features]
+        max_history_length = max(history_lengths)
+        history_input_ids = [
+            feature["autocompressor_history_input_ids"]
+            + [pad_token_id] * (max_history_length - len(feature["autocompressor_history_input_ids"]))
+            for feature in features
+        ]
+        history_attention_mask = [
+            feature["autocompressor_history_attention_mask"]
+            + [0] * (max_history_length - len(feature["autocompressor_history_attention_mask"]))
+            for feature in features
+        ]
+        segment_lengths = {
+            int(feature["autocompressor_segment_length"]) for feature in features
+        }
+        boundary_ids = {
+            int(feature["autocompressor_boundary_token_id"]) for feature in features
+        }
+        if len(segment_lengths) != 1 or len(boundary_ids) != 1:
+            raise ValueError("autocompressor_episode batch contains mixed metadata")
+        batch["autocompressor_history_input_ids"] = torch.tensor(
+            history_input_ids, dtype=torch.long
+        )
+        batch["autocompressor_history_attention_mask"] = torch.tensor(
+            history_attention_mask, dtype=torch.long
+        )
+        batch["autocompressor_segment_length"] = torch.tensor(
+            next(iter(segment_lengths)), dtype=torch.long
+        )
+        batch["autocompressor_boundary_token_id"] = torch.tensor(
+            next(iter(boundary_ids)), dtype=torch.long
+        )
+        return batch
+
+
+class AutoCompressorSessionEpisodeCollator(EpisodeCausalLMCollator):
+    """Add explicit session-packed history to standard episode SFT batches."""
+
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
+        batch = super().__call__(features)
+        if len(features) != 1:
+            raise ValueError(
+                "autocompressor_session_episode requires per-device batch size 1"
+            )
+        pad_token_id = self.tokenizer.pad_token_id
+        history_lengths = [
+            len(feature["autocompressor_history_input_ids"]) for feature in features
+        ]
+        max_history_length = max(history_lengths)
+        history_input_ids = [
+            feature["autocompressor_history_input_ids"]
+            + [pad_token_id]
+            * (max_history_length - len(feature["autocompressor_history_input_ids"]))
+            for feature in features
+        ]
+        history_attention_mask = [
+            feature["autocompressor_history_attention_mask"]
+            + [0]
+            * (max_history_length - len(feature["autocompressor_history_attention_mask"]))
+            for feature in features
+        ]
+        history_session_ids = [
+            feature["autocompressor_history_session_ids"]
+            + [-1]
+            * (max_history_length - len(feature["autocompressor_history_session_ids"]))
+            for feature in features
+        ]
+        boundary_ids = {
+            int(feature["autocompressor_boundary_token_id"]) for feature in features
+        }
+        if len(boundary_ids) != 1:
+            raise ValueError("autocompressor_session_episode batch contains mixed metadata")
+        batch["autocompressor_history_input_ids"] = torch.tensor(
+            history_input_ids, dtype=torch.long
+        )
+        batch["autocompressor_history_attention_mask"] = torch.tensor(
+            history_attention_mask, dtype=torch.long
+        )
+        batch["autocompressor_history_session_ids"] = torch.tensor(
+            history_session_ids, dtype=torch.long
+        )
+        batch["autocompressor_boundary_token_id"] = torch.tensor(
+            next(iter(boundary_ids)), dtype=torch.long
+        )
+        return batch
+
+
+class AutoCompressorSurprisalEpisodeCollator(EpisodeCausalLMCollator):
+    """Attach aligned precomputed surprisal metadata to one episode batch."""
+
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
+        batch = super().__call__(features)
+        if len(features) != 1:
+            raise ValueError("autocompressor_surprisal_episode requires per-device batch size 1")
+        feature = features[0]
+        history = feature["autocompressor_history_input_ids"]
+        scores = feature["autocompressor_history_surprisal"]
+        segment_ids = feature["autocompressor_segment_ids"]
+        if len(history) != len(scores) or len(history) != len(segment_ids):
+            raise ValueError("surprisal history tokens, scores, and segment ids must align")
+        if any(int(value) < 0 for value in segment_ids) or any(
+            int(right) < int(left) for left, right in zip(segment_ids, segment_ids[1:])
+        ):
+            raise ValueError("surprisal segment ids must be non-negative and monotonic")
+        batch["autocompressor_history_input_ids"] = torch.tensor([history], dtype=torch.long)
+        batch["autocompressor_history_attention_mask"] = torch.ones((1, len(history)), dtype=torch.long)
+        batch["autocompressor_history_surprisal"] = torch.tensor([scores], dtype=torch.float32)
+        batch["autocompressor_segment_ids"] = torch.tensor([segment_ids], dtype=torch.long)
+        batch["autocompressor_boundary_token_id"] = torch.tensor(
+            int(feature["autocompressor_boundary_token_id"]), dtype=torch.long
+        )
+        return batch
+
+
 def build_data_collator(training_mode: str, tokenizer):
+    if training_mode == "autocompressor_ssw":
+        return AutoCompressorSSWCollator(tokenizer)
+    if training_mode == "autocompressor_message_ce":
+        return AutoCompressorMessageCECollator(tokenizer)
+    if training_mode == "autocompressor_episode":
+        return AutoCompressorEpisodeCollator(tokenizer)
+    if training_mode == "autocompressor_session_episode":
+        return AutoCompressorSessionEpisodeCollator(tokenizer)
+    if training_mode == "autocompressor_surprisal_episode":
+        return AutoCompressorSurprisalEpisodeCollator(tokenizer)
     if training_mode == "episode":
         return EpisodeCausalLMCollator(tokenizer)
     if training_mode == "dialogue":
@@ -2489,10 +3831,41 @@ def build_data_collator(training_mode: str, tokenizer):
 
 def main() -> None:
     args = parse_args()
+    if args.memory_write_granularity == "embedding_semantic":
+        if args.semantic_model_path is None:
+            raise ValueError("embedding_semantic requires --semantic-model-path")
+        if args.training_mode != "episode":
+            raise ValueError("embedding_semantic currently requires --training-mode episode")
+        configure_semantic_encoder(
+            args.semantic_model_path,
+            percentile=args.semantic_percentile,
+            max_chunk_tokens=args.semantic_max_chunk_tokens,
+            selection_budget=args.semantic_selection_budget,
+        )
+    if args.training_mode in {
+        "autocompressor_ssw",
+        "autocompressor_episode",
+        "autocompressor_session_episode",
+        "autocompressor_surprisal_episode",
+        "autocompressor_message_ce",
+    }:
+        if args.memory_write_granularity != "message_mean":
+            raise ValueError(
+                "AutoCompressor causal CE requires --memory-write-granularity message_mean"
+            )
+        if args.per_device_train_batch_size != 1:
+            raise ValueError(
+                "AutoCompressor causal CE requires --per-device-train-batch-size 1"
+            )
     if args.gradient_checkpointing:
         raise ValueError(
             "Gradient checkpointing is currently incompatible with Delta-Mem's stateful token updates. "
             "Disable --gradient-checkpointing before training."
+        )
+    if args.training_mode == "autocompressor_surprisal_episode" and args.tokenized_dataset_dir is None:
+        raise ValueError(
+            "autocompressor_surprisal_episode requires --tokenized-dataset-dir produced by "
+            "deltamem.tools.precompute_autocompressor_surprisal"
         )
     dtype = get_dtype(args.dtype)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2509,7 +3882,13 @@ def main() -> None:
         local_rank=local_rank,
     )
     effective_training_mode = str(tokenized_meta["training_mode"])
-    effective_group_by_length = args.group_by_length and effective_training_mode != "episode"
+    effective_group_by_length = args.group_by_length and effective_training_mode not in {
+        "episode",
+        "autocompressor_episode",
+        "autocompressor_session_episode",
+        "autocompressor_surprisal_episode",
+        "autocompressor_message_ce",
+    }
     if args.group_by_length and not effective_group_by_length and local_rank in (-1, 0):
         print(
             "Disabling group_by_length for episode training because startup sorting is prohibitively slow at episode scale."
@@ -2570,6 +3949,22 @@ def main() -> None:
         memory_write_proposals_per_message=args.memory_write_proposals_per_message,
     )
     replaced = attach_delta_mem(model, delta_config)
+    if args.init_adapter_dir is not None:
+        loaded_config = load_delta_mem_adapter(model, args.init_adapter_dir)
+        requested_config = asdict(delta_config)
+        loaded_config_dict = asdict(loaded_config)
+        mismatches = {
+            key: (requested_config.get(key), loaded_config_dict.get(key))
+            for key in sorted(set(requested_config) | set(loaded_config_dict))
+            if requested_config.get(key) != loaded_config_dict.get(key)
+        }
+        if mismatches:
+            raise ValueError(
+                "Initial adapter config does not exactly match the requested Delta-Mem config: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
+        if local_rank in (-1, 0):
+            print(f"Loaded initial Delta-Mem adapter: {args.init_adapter_dir}")
     trainable_names = freeze_non_delta_mem_params(model)
 
     warmup_steps = compute_warmup_steps(
@@ -2661,6 +4056,8 @@ def main() -> None:
         context_ablation_mode=args.context_ablation_mode,
         context_ablation_no_state_prob=args.context_ablation_no_state_prob,
         context_ablation_state_only_prob=args.context_ablation_state_only_prob,
+        autocompressor_offload_activations=args.autocompressor_offload_activations,
+        autocompressor_loss_weight=args.autocompressor_loss_weight,
     )
     trainer.log_delta_debug_stats = args.log_delta_debug_stats
     trainer.train()
@@ -2671,12 +4068,17 @@ def main() -> None:
         save_delta_mem_adapter(base_model, args.output_dir, delta_config)
         summary = {
             "output_dir": str(args.output_dir),
+            "init_adapter_dir": None if args.init_adapter_dir is None else str(args.init_adapter_dir),
             "num_replaced_modules": len(replaced),
             "num_trainable_tensors": len(trainable_names),
             "first_replaced_modules": replaced[:8],
             "first_trainable_tensors": trainable_names[:8],
             "train_samples": len(tokenized),
             "training_mode": effective_training_mode,
+            "autocompressor_segment_length": args.autocompressor_segment_length,
+            "autocompressor_max_length": args.autocompressor_max_length,
+            "autocompressor_offload_activations": args.autocompressor_offload_activations,
+            "autocompressor_loss_weight": args.autocompressor_loss_weight,
             "assistant_loss_mode": args.assistant_loss_mode,
             "episode_recent_messages": args.episode_recent_messages,
             "max_write_length": args.max_write_length,

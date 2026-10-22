@@ -20,8 +20,8 @@ The required frozen backbone is `Qwen/Qwen3-4B-Instruct-2507`; its weights are d
 - Adapter: rank 8, alpha 16, Q/O attention heads, `online_gain=0.05`; see `delta_mem_config.json` for the full architecture.
 - LoCoMo: 10 conversations, 1,540 questions, seed 42, session granularity, `full_history_mode=official_prompt`, batch size 32, maximum answer length 50. History decoding used sampling with temperature 0.4, top-p 0.9 and top-k 10.
 - Result: Overall **50.02%**; multi-hop 40.25%, temporal 39.69%, open-domain 17.08%, single-hop 61.00%.
-- Original GPU5 result SHA-256: `5344437a8abd5a3885f83f17e3f18fd57f7caf3e17bf7dd2b762e080b5b8af2a`. The original result file is not included here because this directory is for model artifacts.
+- Original GPU5 result SHA-256: `5344437a8abd5a3885f83f17f3e18fd57f7caf3e17bf7dd2b762e080b5b8af2a`. The [original result JSON](../../docs/results/PAWmem_QASPER_LoCoMo_official_prompt_50p02.json) is included in the repository.
 
 The 46.69% run used `history_replay` and is **not** the evaluation protocol for this result. Its adapter weight and configuration checksums match these files; the evaluation mode differs.
 
-The runtime used for the reported result includes the Session/OSGM dd_decay implementation from the GPU5 experiment. The repository's earlier public commit alone may not contain that full runtime. Treat this package as the verified model artifact and use the matching implementation and `official_prompt` settings when reproducing the score.
+The matching Session/OSGM dd_decay runtime and runnable commands are now in this repository. See [PAWmem reproduction guide](../../docs/PAWmem_reproduction.md).

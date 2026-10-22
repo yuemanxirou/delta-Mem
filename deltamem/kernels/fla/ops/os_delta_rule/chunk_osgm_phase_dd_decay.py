@@ -72,6 +72,17 @@ def osgm_dd_decay_phase1_fwd_kernel(
             d_next = tl.maximum(d_next, d_min)
             d_next = tl.minimum(d_next, d_max)
 
+        # Triton in the runtime environment does not expose tl.isnan().
+        # Detect NaN via x != x and infinities via explicit comparisons.
+        # Saturate invalid recurrence values at the configured upper bound.
+        d_next = tl.where(
+            (d_next != d_next)
+            | (d_next == float("inf"))
+            | (d_next == float("-inf")),
+            d_max,
+            d_next,
+        )
+
         d_curr = d_next
 
         p_k += stride_kt

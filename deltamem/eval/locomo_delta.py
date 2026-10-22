@@ -251,6 +251,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--history-replay-write-during-generation",
+        action="store_true",
+        help=(
+            "Keep Delta-Mem writes enabled while encoding the QA prompt and decoding the answer "
+            "in history_replay mode. By default, history_replay treats QA as a read-only probe "
+            "of the prebuilt history state."
+        ),
+    )
+    parser.add_argument(
         "--history-do-sample",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -536,6 +545,7 @@ def _generate_prompt_chunk(
     top_k: int,
     batch_seed: int,
     delta_state: dict[str, torch.Tensor] | None,
+    write_during_generation: bool,
 ) -> list[str]:
     rendered_prompts = [_render_chat_prompt(tokenizer, messages) for messages in message_batches]
     if tokenizer.pad_token_id is None:
@@ -567,7 +577,7 @@ def _generate_prompt_chunk(
     if torch.cuda.is_available() and device.startswith("cuda"):
         rng_devices = [torch.device(device)]
 
-    set_delta_mem_write_enabled(model, False)
+    set_delta_mem_write_enabled(model, bool(write_during_generation))
     try:
         with torch.random.fork_rng(devices=rng_devices):
             torch.manual_seed(batch_seed)
@@ -610,6 +620,7 @@ def _batched_generate_raw_predictions(
     top_k: int,
     batch_seed: int,
     delta_state: dict[str, torch.Tensor] | None,
+    write_during_generation: bool,
 ) -> list[str]:
     if not message_batches:
         return []
@@ -626,6 +637,7 @@ def _batched_generate_raw_predictions(
             top_k=top_k,
             batch_seed=batch_seed,
             delta_state=delta_state,
+            write_during_generation=write_during_generation,
         )
     except torch.OutOfMemoryError:
         if len(message_batches) == 1:
@@ -648,6 +660,7 @@ def _batched_generate_raw_predictions(
             top_k=top_k,
             batch_seed=batch_seed,
             delta_state=_slice_delta_state(delta_state, 0, split),
+            write_during_generation=write_during_generation,
         )
         second = _batched_generate_raw_predictions(
             model=model,
@@ -661,6 +674,7 @@ def _batched_generate_raw_predictions(
             top_k=top_k,
             batch_seed=batch_seed + split,
             delta_state=_slice_delta_state(delta_state, split, len(message_batches)),
+            write_during_generation=write_during_generation,
         )
         return first + second
 
@@ -682,12 +696,13 @@ def _build_sample_cache(
             message_granularity=history_message_granularity,
         )
         cache["history_messages"] = history_messages
-        cache["full_snapshot"] = build_teacher_forced_snapshot(
-            model,
-            tokenizer,
-            device,
-            history_messages,
-        )
+        if not getattr(build_teacher_forced_snapshot, "question_aware", False):
+            cache["full_snapshot"] = build_teacher_forced_snapshot(
+                model,
+                tokenizer,
+                device,
+                history_messages,
+            )
 
     return cache
 
@@ -709,6 +724,7 @@ def evaluate_locomo_conditions(
     history_temperature: float,
     history_top_p: float,
     history_top_k: int,
+    history_replay_write_during_generation: bool,
     eval_batch_size: int,
     progress_bar: Any = None,
     progress_jsonl: Path | None = None,
@@ -811,6 +827,14 @@ def evaluate_locomo_conditions(
                 if condition_name == "full_history_replay":
                     snapshot = cast(Any, cache.get("full_snapshot"))
                     history_messages = cast(list[dict[str, str]], cache["history_messages"])
+                    if snapshot is None and getattr(build_teacher_forced_snapshot, "question_aware", False):
+                        snapshot = build_teacher_forced_snapshot(
+                            model,
+                            tokenizer,
+                            device,
+                            history_messages,
+                            question_prompt,
+                        )
                     prompt_messages = history_messages + [{"role": "user", "content": question_prompt}]
                     if snapshot is not None and getattr(snapshot, "delta_state", None):
                         use_delta_state = True
@@ -832,6 +856,10 @@ def evaluate_locomo_conditions(
                 top_k=history_top_k,
                 batch_seed=seed + batch_start + (condition_offset * 100003),
                 delta_state=delta_state,
+                write_during_generation=(
+                    full_history_mode == "history_replay"
+                    and history_replay_write_during_generation
+                ),
             )
 
             for item, raw_prediction in zip(batch_items, raw_predictions):
@@ -933,6 +961,7 @@ def main() -> None:
             "answer_reserve_tokens": args.answer_reserve_tokens,
             "full_history_mode": args.full_history_mode,
             "history_message_granularity": args.history_message_granularity,
+            "history_replay_write_during_generation": args.history_replay_write_during_generation,
             "history_decode": {
                 "do_sample": args.history_do_sample,
                 "temperature": args.history_temperature,
@@ -969,6 +998,7 @@ def main() -> None:
                 history_temperature=args.history_temperature,
                 history_top_p=args.history_top_p,
                 history_top_k=args.history_top_k,
+                history_replay_write_during_generation=args.history_replay_write_during_generation,
                 eval_batch_size=args.eval_batch_size,
                 progress_bar=progress_bar,
                 progress_jsonl=progress_jsonl,
@@ -1043,6 +1073,7 @@ def main() -> None:
                 history_temperature=args.history_temperature,
                 history_top_p=args.history_top_p,
                 history_top_k=args.history_top_k,
+                history_replay_write_during_generation=args.history_replay_write_during_generation,
                 eval_batch_size=args.eval_batch_size,
                 progress_bar=progress_bar,
                 progress_jsonl=progress_jsonl,

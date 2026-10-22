@@ -27,6 +27,11 @@ from deltamem.core.backbone_compat import (
 from deltamem.kernels.affine_scan import triton_affine_scan, triton_scan_support
 # osgm new
 from deltamem.kernels.affine_scan_osgm import triton_affine_scan_osgm
+from deltamem.kernels.affine_scan_osgm_decay import triton_affine_scan_osgm_decay
+from deltamem.kernels.affine_scan_osgm_dd_decay import triton_affine_scan_osgm_dd_decay
+from deltamem.kernels.affine_scan_osgm_dd_decay_sigmoid import triton_affine_scan_osgm_dd_decay_sigmoid
+from deltamem.kernels.affine_scan_osgm_dd_decay_nan_guard import triton_affine_scan_osgm_dd_decay_nan_guard
+
 
 SUPPORTED_BASE_ATTENTION_TYPES = (Qwen3Attention,)
 if HAS_SMOLLM3:
@@ -43,6 +48,7 @@ VALID_MEMORY_WRITE_GRANULARITIES = (
     "token",
     "message_mean",
     "sentence_mean",
+    "embedding_semantic",
 )
 VALID_MEMORY_PARTITION_READ_MODES = ("softmax",)
 VALID_GLOBAL_MEMORY_MODES = ("shared_rw",)
@@ -616,6 +622,54 @@ class DeltaMemAttention(nn.Module):
         self.osgm_d_min = 1.0
         self.osgm_d_max = 2.0
 
+        # --- osgm_dd_decay (exp) hyperparams, overridable via env for clip sweep ---
+        self.osgm_dd_decay_d_max = float(os.environ.get("DELTA_MEM_OSGM_DD_DECAY_DMAX", "2.0"))
+        self.osgm_dd_decay_d_min = float(os.environ.get("DELTA_MEM_OSGM_DD_DECAY_DMIN", "1.0"))
+
+        # --- osgm_decay ---
+        self.osgm_decay_gamma_log: torch.Tensor | None = None  # per-head, H=1
+        self.osgm_dd_decay_g: torch.Tensor | None = None  # per-token per-head, [B, T, 1]
+        self.osgm_dd_decay_sigmoid_g: torch.Tensor | None = None  # per-token per-head, [B, T, 1]
+
+
+    def _get_osgm_decay_gamma_log(self, device: torch.device) -> torch.Tensor:
+        if self.osgm_decay_gamma_log is None:
+            retention = 0.999
+            gamma_log_val = math.log(retention / (1.0 - retention))
+            self.osgm_decay_gamma_log = torch.tensor(
+                [gamma_log_val],
+                dtype=torch.float32,
+                device=device,
+            )
+        return self.osgm_decay_gamma_log
+
+    def _get_osgm_dd_decay_g(self, device: torch.device, batch_size: int, seq_len: int) -> torch.Tensor:
+        expected_shape = (batch_size, seq_len, 1)
+        if self.osgm_dd_decay_g is None or self.osgm_dd_decay_g.shape != expected_shape:
+            retention = 0.999
+            g_val = math.log(retention / (1.0 - retention))
+            self.osgm_dd_decay_g = torch.full(
+                expected_shape,
+                g_val,
+                dtype=torch.float32,
+                device=device,
+            )
+        return self.osgm_dd_decay_g
+
+    def _get_osgm_dd_decay_sigmoid_g(self, device: torch.device, batch_size: int, seq_len: int) -> torch.Tensor:
+        expected_shape = (batch_size, seq_len, 1)
+        if self.osgm_dd_decay_sigmoid_g is None or self.osgm_dd_decay_sigmoid_g.shape != expected_shape:
+            retention = 0.999
+            g_val = math.log(retention / (1.0 - retention))
+            self.osgm_dd_decay_sigmoid_g = torch.full(
+                expected_shape,
+                g_val,
+                dtype=torch.float32,
+                device=device,
+            )
+        return self.osgm_dd_decay_sigmoid_g
+
+
     def _normalize_query_states(self, states: torch.Tensor) -> torch.Tensor:
         q_norm = getattr(self.base, "q_norm", None)
         if q_norm is None:
@@ -698,6 +752,9 @@ class DeltaMemAttention(nn.Module):
     def reset_state(self) -> None:
         self.delta_state = None
         self.osgm_precond_state = None
+        self.osgm_decay_gamma_log = None   # osgm_decay
+        self.osgm_dd_decay_g = None # osgm_dd_decay
+        self.osgm_dd_decay_sigmoid_g = None # osgm_dd_decay_sigmoid
         self.read_context_mask = None
         self.last_beta_mean = None
         self.last_lambda_mean = None
@@ -1087,7 +1144,27 @@ class DeltaMemAttention(nn.Module):
             return None
         projected = F.linear(reads, weight)
         scale = self._delta_scale_multiplier(head_name, projected.dtype, projected.device)
-        return projected * self.delta_scaling * scale
+        projected = projected * self.delta_scaling * scale
+        if os.environ.get("DELTA_MEM_SANITIZE_DELTA_PROJECTIONS", "0") in ("1", "true", "True"):
+            # Long-context OSGM recurrences can occasionally produce non-finite
+            # reads.  Letting those values reach generation turns every logit
+            # into NaN and makes torch.multinomial trigger a device-side assert.
+            # This guard is opt-in so training and normal evaluation semantics
+            # remain unchanged.  Finite outliers are clipped before attention
+            # dot products can overflow as well.
+            clip_value = max(
+                float(os.environ.get("DELTA_MEM_DELTA_PROJECTION_CLIP", "10000.0")),
+                0.0,
+            )
+            projected = torch.nan_to_num(
+                projected,
+                nan=0.0,
+                posinf=clip_value,
+                neginf=-clip_value,
+            )
+            if clip_value > 0.0:
+                projected = projected.clamp(min=-clip_value, max=clip_value)
+        return projected
 
     def _resolve_read_context_mask(
         self,
@@ -1431,7 +1508,11 @@ class DeltaMemAttention(nn.Module):
         token_mask: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         sentence_inputs = self._sentence_write_inputs(hidden_states, token_mask)
-        if not self.write_enabled or self.memory_write_granularity != "sentence_mean" or sentence_inputs is None:
+        if (
+            not self.write_enabled
+            or self.memory_write_granularity not in {"sentence_mean", "embedding_semantic"}
+            or sentence_inputs is None
+        ):
             return None, None, None
         message_ids, sentence_ids, active_mask = sentence_inputs
         max_sentence_id = int(sentence_ids.masked_select(active_mask).max().item())
@@ -1677,6 +1758,15 @@ class DeltaMemAttention(nn.Module):
                         .reshape(batch_size * num_partitions, seq_len)
                     )
 
+        if self.scan_impl.startswith("triton_osgm"):
+            scan_dtype = state_for_scan.dtype
+            q_for_scan = q_for_scan.to(scan_dtype)
+            k_for_scan = k_for_scan.to(scan_dtype)
+            v_for_scan = v_for_scan.to(scan_dtype)
+            keep_for_scan = keep_for_scan.to(scan_dtype)
+            erase_for_scan = erase_for_scan.to(scan_dtype)
+            write_for_scan = write_for_scan.to(scan_dtype)
+
         if self.scan_impl == "triton_osgm":
             precond_state = getattr(self, "osgm_precond_state", None)
 
@@ -1716,6 +1806,151 @@ class DeltaMemAttention(nn.Module):
             )
 
             # 仍保持 [B_scan, 1, rank] 的扁平形式。
+            self.osgm_precond_state = final_d
+
+        elif self.scan_impl == "triton_osgm_decay":
+            precond_state = getattr(self, "osgm_precond_state", None)
+            gamma_log = self._get_osgm_decay_gamma_log(k_for_scan.device)
+
+            expected_precond_shape = (
+                state_for_scan.size(0),
+                1,
+                k_for_scan.size(-1),
+            )
+
+            # batch、head 或 partition 数量发生变化时，旧状态不能继续使用。
+            if precond_state is not None:
+                if (
+                    tuple(precond_state.shape) != expected_precond_shape
+                    or precond_state.device != k_for_scan.device
+                ):
+                    precond_state = None
+
+            final_state, reads, final_d = triton_affine_scan_osgm_decay(
+                state=state_for_scan,
+                q=q_for_scan,
+                k=k_for_scan,
+                v=v_for_scan,
+                keep=keep_for_scan,
+                erase=erase_for_scan,
+                write=write_for_scan,
+                gamma_log=gamma_log,
+                token_mask=token_mask_for_scan,
+                initial_d=precond_state,
+                eta=getattr(self, "osgm_decay_eta", 0.03),
+                use_denominator=getattr(
+                    self,
+                    "osgm_decay_use_denominator",
+                    True,
+                ),
+                d_min=getattr(self, "osgm_decay_d_min", 1.0),
+                d_max=getattr(self, "osgm_decay_d_max", 2.0),
+                output_final_state=True,
+            )
+
+            self.osgm_precond_state = final_d
+
+        elif self.scan_impl == "triton_osgm_dd_decay":
+            precond_state = getattr(self, "osgm_precond_state", None)
+            g = self._get_osgm_dd_decay_g(k_for_scan.device, state_for_scan.size(0), k_for_scan.size(1))
+
+            expected_precond_shape = (
+                state_for_scan.size(0),
+                1,
+                k_for_scan.size(-1),
+            )
+
+            # batch、head 或 partition 数量发生变化时，旧状态不能继续使用。
+            if precond_state is not None:
+                if (
+                    tuple(precond_state.shape) != expected_precond_shape
+                    or precond_state.device != k_for_scan.device
+                ):
+                    precond_state = None
+
+            use_nan_guard = os.environ.get("DELTA_MEM_OSGM_DD_DECAY_USE_NAN_GUARD", "0") in ("1", "true", "True")
+            scan_fn = triton_affine_scan_osgm_dd_decay_nan_guard if use_nan_guard else triton_affine_scan_osgm_dd_decay
+            final_state, reads, final_d = scan_fn(
+                state=state_for_scan,
+                q=q_for_scan,
+                k=k_for_scan,
+                v=v_for_scan,
+                keep=keep_for_scan,
+                erase=erase_for_scan,
+                write=write_for_scan,
+                g=g,
+                token_mask=token_mask_for_scan,
+                initial_d=precond_state,
+                eta=getattr(self, "osgm_dd_decay_eta", 0.03),
+                use_denominator=getattr(
+                    self,
+                    "osgm_dd_decay_use_denominator",
+                    True,
+                ),
+                d_min=getattr(self, "osgm_dd_decay_d_min", 1.0),
+                d_max=getattr(self, "osgm_dd_decay_d_max", 2.0),
+                output_final_state=True,
+            )
+
+            # AutoCompressor training observes a bounded number of segment
+            # writes, while message-level replay can contain many more
+            # recurrent writes.  A learned key distribution that is stable
+            # over the training horizon can therefore drive the OSGM state
+            # far outside that distribution at inference time.  Keep this
+            # projection opt-in so existing OSGM experiments are unchanged.
+            state_norm_max = float(
+                os.environ.get("DELTA_MEM_OSGM_DD_DECAY_STATE_NORM_MAX", "0")
+            )
+            if state_norm_max > 0.0:
+                state_fp32 = final_state.float()
+                state_norm = torch.linalg.vector_norm(
+                    state_fp32, dim=(-2, -1), keepdim=True
+                )
+                state_scale = (state_norm_max / state_norm.clamp_min(1e-12)).clamp(max=1.0)
+                final_state = (state_fp32 * state_scale).to(final_state.dtype)
+
+            self.osgm_precond_state = final_d
+
+        elif self.scan_impl == "triton_osgm_dd_decay_sigmoid":
+            precond_state = getattr(self, "osgm_precond_state", None)
+            g = self._get_osgm_dd_decay_sigmoid_g(k_for_scan.device, state_for_scan.size(0), k_for_scan.size(1))
+
+            expected_precond_shape = (
+                state_for_scan.size(0),
+                1,
+                k_for_scan.size(-1),
+            )
+
+            # batch、head 或 partition 数量发生变化时，旧状态不能继续使用。
+            if precond_state is not None:
+                if (
+                    tuple(precond_state.shape) != expected_precond_shape
+                    or precond_state.device != k_for_scan.device
+                ):
+                    precond_state = None
+
+            final_state, reads, final_d = triton_affine_scan_osgm_dd_decay_sigmoid(
+                state=state_for_scan,
+                q=q_for_scan,
+                k=k_for_scan,
+                v=v_for_scan,
+                keep=keep_for_scan,
+                erase=erase_for_scan,
+                write=write_for_scan,
+                g=g,
+                token_mask=token_mask_for_scan,
+                initial_d=precond_state,
+                eta=getattr(self, "osgm_dd_decay_sigmoid_eta", 0.03),
+                use_denominator=getattr(
+                    self,
+                    "osgm_dd_decay_sigmoid_use_denominator",
+                    True,
+                ),
+                d_min=getattr(self, "osgm_dd_decay_sigmoid_d_min", 1.0),
+                d_max=getattr(self, "osgm_dd_decay_sigmoid_d_max", 2.0),
+                output_final_state=True,
+            )
+
             self.osgm_precond_state = final_d
 
         else:
@@ -1840,6 +2075,11 @@ class DeltaMemAttention(nn.Module):
                     token_mask,
                 )
             elif self.memory_write_granularity == "sentence_mean":
+                write_hidden, write_mask, write_message_ids = self._build_sentence_write_means(
+                    hidden_states,
+                    token_mask,
+                )
+            elif self.memory_write_granularity == "embedding_semantic":
                 write_hidden, write_mask, write_message_ids = self._build_sentence_write_means(
                     hidden_states,
                     token_mask,

@@ -17,6 +17,10 @@ This repository contains the main δ-mem implementation, training scripts, evalu
 In long-term agent scenarios, what is truly needed is a more efficient memory mechanism. Such a mechanism should not endlessly increase the context burden like full-text retrieval, nor should it behave like static parametric memory that becomes fixed after training. Instead, it should be able to update dynamically during interaction and directly influence the model’s internal computation during inference. Motivated by this, we propose **δ-mem**, a lightweight online memory mechanism for large language models.
 
 
+## PAWmem reproducible release
+
+The **PAWmem Qwen3-4B × QASPER History-turn** release includes the trained adapter, its 2,219-example training JSONL, LoCoMo evaluation JSON, the matching Session/OSGM dd_decay code, and ready-to-run training and evaluation scripts. The verified LoCoMo result is **50.02% using `official_prompt`**. Start with the [PAWmem reproduction guide](docs/PAWmem_reproduction.md) for exact files, setup, commands, checksums, and limitations.
+
 ## Released Model
 
 | Model | Base model | Adapter | Hugging Face |
